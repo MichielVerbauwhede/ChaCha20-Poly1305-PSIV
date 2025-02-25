@@ -1,0 +1,2226 @@
+From b6b22f0ee5b43d93e1d2bbea44a75d08ffb6b5ed Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@e.mail>
+Date: Thu, 3 Oct 2024 10:42:08 +0200
+Subject: [PATCH] chacha20-psiv
+
+---
+ README.markdown                               |  55 +--
+ performance_measurements/measure.h            |  71 ++++
+ performance_measurements/results.txt          | 143 +++++++
+ performance_measurements/results/zen2.txt     | 383 ++++++++++++++++++
+ performance_measurements/test.c               | 199 +++++++++
+ .../sodium/aead_chacha20poly1305.c            | 333 +++++++++++++++
+ .../chacha20/dolbeau/chacha20_dolbeau-avx2.c  |  77 +++-
+ .../chacha20/dolbeau/chacha20_dolbeau-ssse3.c |  77 +++-
+ .../crypto_stream/chacha20/ref/chacha20_ref.c |  77 +++-
+ .../crypto_stream/chacha20/stream_chacha20.c  |  50 +++
+ .../crypto_stream/chacha20/stream_chacha20.h  |   7 +
+ .../sodium/crypto_aead_chacha20poly1305.h     | 140 +++++++
+ .../include/sodium/crypto_stream_chacha20.h   |  34 ++
+ test/default/aead_chacha20poly1305.c          | 151 +++++++
+ test/default/aead_chacha20poly13052.c         | 163 ++++++++
+ 15 files changed, 1907 insertions(+), 53 deletions(-)
+ create mode 100644 performance_measurements/measure.h
+ create mode 100644 performance_measurements/results.txt
+ create mode 100644 performance_measurements/results/zen2.txt
+ create mode 100644 performance_measurements/test.c
+
+diff --git a/README.markdown b/README.markdown
+index 412693d3..52987ff8 100644
+--- a/README.markdown
++++ b/README.markdown
+@@ -1,47 +1,8 @@
+-[![Build Status](https://travis-ci.org/jedisct1/libsodium.svg?branch=master)](https://travis-ci.org/jedisct1/libsodium?branch=master)
+-[![Windows build status](https://ci.appveyor.com/api/projects/status/fu8s2elx25il98hj?svg=true)](https://ci.appveyor.com/project/jedisct1/libsodium)
+-[![Coverity Scan Build Status](https://scan.coverity.com/projects/2397/badge.svg)](https://scan.coverity.com/projects/2397)
+-[![Azure build status](https://jedisct1.visualstudio.com/Libsodium/_apis/build/status/jedisct1.libsodium?branchName=stable)](https://jedisct1.visualstudio.com/Libsodium/_build/latest?definitionId=3&branchName=stable)
+-
+-![libsodium](https://raw.github.com/jedisct1/libsodium/master/logo.png)
+-============
+-
+-Sodium is a new, easy-to-use software library for encryption,
+-decryption, signatures, password hashing and more.
+-
+-It is a portable, cross-compilable, installable, packageable
+-fork of [NaCl](http://nacl.cr.yp.to/), with a compatible API, and an
+-extended API to improve usability even further.
+-
+-Its goal is to provide all of the core operations needed to build
+-higher-level cryptographic tools.
+-
+-Sodium supports a variety of compilers and operating systems,
+-including Windows (with MingW or Visual Studio, x86 and x64), iOS, Android,
+-as well as Javascript and Webassembly.
+-
+-## Documentation
+-
+-The documentation is available on Gitbook and built from the [libsodium-doc](https://github.com/jedisct1/libsodium-doc) repository:
+-
+-* [libsodium documentation](https://download.libsodium.org/doc/) -
+-online, requires Javascript.
+-* [offline documentation](https://www.gitbook.com/book/jedisct1/libsodium/details)
+-in PDF format.
+-
+-## Integrity Checking
+-
+-The integrity checking instructions (including the signing key for libsodium)
+-are available in the [installation](https://download.libsodium.org/doc/installation#integrity-checking)
+-section of the documentation.
+-
+-## Community
+-
+-A mailing-list is available to discuss libsodium.
+-
+-In order to join, just send a random mail to `sodium-subscribe` {at}
+-`pureftpd` {dot} `org`.
+-
+-## License
+-
+-[ISC license](https://en.wikipedia.org/wiki/ISC_license).
++How to compile:
++```
++./configure --prefix=$(pwd)/performance_measurements
++make clean && make check && make install
++cd performance_measurements
++gcc -Iinclude  test.c lib/libsodium.a -Wno-unused-result -lm
++./a.out
++```
+\ No newline at end of file
+diff --git a/performance_measurements/measure.h b/performance_measurements/measure.h
+new file mode 100644
+index 00000000..2836673c
+--- /dev/null
++++ b/performance_measurements/measure.h
+@@ -0,0 +1,71 @@
++#ifndef __measure_h__
++#define __measure_h__
++#include <time.h>
++#include <math.h>
++#include <stdlib.h>
++
++int cmp_time(const void *a, const void *b)
++{
++    return (*(unsigned long long *)a - *(unsigned long long *)b);
++}
++
++unsigned long long compute_measurement_sum(unsigned long long *measurements, size_t size)
++{
++    unsigned long long res = 0;
++    for (unsigned long long i = 0; i < size; i++)
++    {
++        res += measurements[i];
++    }
++    return res;
++}
++
++unsigned long long compute_squared_measurement_sum(unsigned long long *measurements, size_t size)
++{
++    unsigned long long res = 0;
++    for (unsigned long long i = 0; i < size; i++)
++    {
++        res += measurements[i] * measurements[i];
++    }
++    return res;
++}
++#define BILLION 1000000000
++unsigned long long time_difference(struct timespec start, struct timespec end)
++{
++    return BILLION * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec;
++}
++
++struct statistics
++{
++    double minimum, lower_quartile, median, upper_quartile, maximum;
++    double average, variance;
++    double scaling_factor;
++};
++
++#define measure_everything(warmup, nsamples, stats, x)                                                                   \
++    {                                                                                                                    \
++        struct timespec start, end;                                                                                      \
++        unsigned long long measurements[nsamples];                                                                       \
++        for (size_t _i = 0; _i < warmup; _i++)                                                                           \
++        {                                                                                                                \
++            x;                                                                                                           \
++        }                                                                                                                \
++        for (size_t _k = 0; _k < nsamples; _k++)                                                                         \
++        {                                                                                                                \
++            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);                                                              \
++            x;                                                                                                           \
++            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);                                                                \
++            measurements[_k] = time_difference(start, end);                                                              \
++        }                                                                                                                \
++        qsort(measurements, nsamples, sizeof(unsigned long long), cmp_time);                                             \
++        stats.scaling_factor = BILLION;                                                                                  \
++        stats.minimum = measurements[0];                                                                                 \
++        stats.lower_quartile = measurements[nsamples / 4];                                                               \
++        stats.median = measurements[nsamples / 2];                                                                       \
++        stats.upper_quartile = measurements[3 * nsamples / 4];                                                           \
++        stats.maximum = measurements[nsamples - 1];                                                                      \
++        clock_t s = compute_measurement_sum(measurements, nsamples);                                                     \
++        stats.average = s / ((double)nsamples);                                                                          \
++        stats.variance = (compute_squared_measurement_sum(measurements, nsamples) - s * stats.average) / (nsamples - 1); \
++    }
++
++#endif // __measure_h__
+\ No newline at end of file
+diff --git a/performance_measurements/results.txt b/performance_measurements/results.txt
+new file mode 100644
+index 00000000..1076c69f
+--- /dev/null
++++ b/performance_measurements/results.txt
+@@ -0,0 +1,143 @@
++chacha20 of 2 bytes with a minimum of 10.472 MiB/s, a lower quartile of 10.507 MiB/s, a median of 10.509 MiB/s, a upper quartile of 10.511 MiB/s, a maximum of 10.517 MiB/s.
++The average is 10.509 MiB/s and the standard deviation is 0.004 MiB/s.
++The 95% confidence interval is [10.50, 10.52].
++
++chacha20 of 32 bytes with a minimum of 145.713 MiB/s, a lower quartile of 153.274 MiB/s, a median of 153.375 MiB/s, a upper quartile of 153.791 MiB/s, a maximum of 154.073 MiB/s.
++The average is 153.486 MiB/s and the standard deviation is 0.373 MiB/s.
++The 95% confidence interval is [152.37, 154.61].
++
++chacha20 of 512 bytes with a minimum of 1272.427 MiB/s, a lower quartile of 1291.890 MiB/s, a median of 1293.956 MiB/s, a upper quartile of 1296.331 MiB/s, a maximum of 1303.217 MiB/s.
++The average is 1294.078 MiB/s and the standard deviation is 3.219 MiB/s.
++The 95% confidence interval is [1284.42, 1303.73].
++
++chacha20 of 8192 bytes with a minimum of 1388.295 MiB/s, a lower quartile of 1394.591 MiB/s, a median of 1395.494 MiB/s, a upper quartile of 1396.172 MiB/s, a maximum of 1399.001 MiB/s.
++The average is 1394.863 MiB/s and the standard deviation is 2.037 MiB/s.
++The 95% confidence interval is [1388.75, 1400.98].
++
++chacha20 of 16384 bytes with a minimum of 1390.194 MiB/s, a lower quartile of 1397.827 MiB/s, a median of 1398.656 MiB/s, a upper quartile of 1399.251 MiB/s, a maximum of 1401.762 MiB/s.
++The average is 1397.919 MiB/s and the standard deviation is 2.191 MiB/s.
++The 95% confidence interval is [1391.35, 1404.49].
++
++
++aes256gcm encryption of 2 bytes with a minimum of 7.599 MiB/s, a lower quartile of 7.604 MiB/s, a median of 7.607 MiB/s, a upper quartile of 7.622 MiB/s, a maximum of 7.704 MiB/s.
++The average is 7.616 MiB/s and the standard deviation is 0.018 MiB/s.
++The 95% confidence interval is [7.56, 7.67].
++
++aes256gcm decryption of 2 bytes with a minimum of 8.064 MiB/s, a lower quartile of 8.111 MiB/s, a median of 8.114 MiB/s, a upper quartile of 8.119 MiB/s, a maximum of 8.134 MiB/s.
++The average is 8.115 MiB/s and the standard deviation is 0.006 MiB/s.
++The 95% confidence interval is [8.10, 8.13].
++
++aes256gcm encryption of 32 bytes with a minimum of 113.580 MiB/s, a lower quartile of 113.714 MiB/s, a median of 114.621 MiB/s, a upper quartile of 115.470 MiB/s, a maximum of 115.575 MiB/s.
++The average is 114.609 MiB/s and the standard deviation is 0.817 MiB/s.
++The 95% confidence interval is [112.16, 117.06].
++
++aes256gcm decryption of 32 bytes with a minimum of 117.512 MiB/s, a lower quartile of 117.631 MiB/s, a median of 117.651 MiB/s, a upper quartile of 117.667 MiB/s, a maximum of 117.719 MiB/s.
++The average is 117.646 MiB/s and the standard deviation is 0.034 MiB/s.
++The 95% confidence interval is [117.54, 117.75].
++
++aes256gcm encryption of 512 bytes with a minimum of 821.852 MiB/s, a lower quartile of 827.658 MiB/s, a median of 828.122 MiB/s, a upper quartile of 832.470 MiB/s, a maximum of 834.176 MiB/s.
++The average is 829.307 MiB/s and the standard deviation is 2.588 MiB/s.
++The 95% confidence interval is [821.54, 837.07].
++
++aes256gcm decryption of 512 bytes with a minimum of 750.478 MiB/s, a lower quartile of 833.014 MiB/s, a median of 834.975 MiB/s, a upper quartile of 835.846 MiB/s, a maximum of 836.935 MiB/s.
++The average is 834.115 MiB/s and the standard deviation is 4.584 MiB/s.
++The 95% confidence interval is [820.36, 847.87].
++
++aes256gcm encryption of 8192 bytes with a minimum of 1072.786 MiB/s, a lower quartile of 1077.238 MiB/s, a median of 1077.865 MiB/s, a upper quartile of 1078.130 MiB/s, a maximum of 1079.228 MiB/s.
++The average is 1077.316 MiB/s and the standard deviation is 1.308 MiB/s.
++The 95% confidence interval is [1073.39, 1081.24].
++
++aes256gcm decryption of 8192 bytes with a minimum of 1041.142 MiB/s, a lower quartile of 1045.623 MiB/s, a median of 1047.248 MiB/s, a upper quartile of 1047.915 MiB/s, a maximum of 1051.888 MiB/s.
++The average is 1046.821 MiB/s and the standard deviation is 1.533 MiB/s.
++The 95% confidence interval is [1042.22, 1051.42].
++
++aes256gcm encryption of 16384 bytes with a minimum of 1071.173 MiB/s, a lower quartile of 1086.621 MiB/s, a median of 1087.330 MiB/s, a upper quartile of 1087.619 MiB/s, a maximum of 1088.409 MiB/s.
++The average is 1086.765 MiB/s and the standard deviation is 1.376 MiB/s.
++The 95% confidence interval is [1082.64, 1090.89].
++
++aes256gcm decryption of 16384 bytes with a minimum of 1036.093 MiB/s, a lower quartile of 1044.417 MiB/s, a median of 1046.209 MiB/s, a upper quartile of 1047.757 MiB/s, a maximum of 1052.375 MiB/s.
++The average is 1046.112 MiB/s and the standard deviation is 2.382 MiB/s.
++The 95% confidence interval is [1038.97, 1053.26].
++
++
++chacha20poly1305 encryption of 2 bytes with a minimum of 3.661 MiB/s, a lower quartile of 3.665 MiB/s, a median of 3.665 MiB/s, a upper quartile of 3.666 MiB/s, a maximum of 3.667 MiB/s.
++The average is 3.665 MiB/s and the standard deviation is 0.001 MiB/s.
++The 95% confidence interval is [3.66, 3.67].
++
++chacha20poly1305 decryption of 2 bytes with a minimum of 3.583 MiB/s, a lower quartile of 3.588 MiB/s, a median of 3.588 MiB/s, a upper quartile of 3.588 MiB/s, a maximum of 3.589 MiB/s.
++The average is 3.588 MiB/s and the standard deviation is 0.000 MiB/s.
++The 95% confidence interval is [3.59, 3.59].
++
++chacha20poly1305 encryption of 32 bytes with a minimum of 52.260 MiB/s, a lower quartile of 52.311 MiB/s, a median of 52.322 MiB/s, a upper quartile of 52.334 MiB/s, a maximum of 52.390 MiB/s.
++The average is 52.323 MiB/s and the standard deviation is 0.017 MiB/s.
++The 95% confidence interval is [52.27, 52.37].
++
++chacha20poly1305 decryption of 32 bytes with a minimum of 40.072 MiB/s, a lower quartile of 50.658 MiB/s, a median of 50.665 MiB/s, a upper quartile of 50.672 MiB/s, a maximum of 50.710 MiB/s.
++The average is 50.642 MiB/s and the standard deviation is 0.560 MiB/s.
++The 95% confidence interval is [48.96, 52.32].
++
++chacha20poly1305 encryption of 512 bytes with a minimum of 431.279 MiB/s, a lower quartile of 432.957 MiB/s, a median of 433.366 MiB/s, a upper quartile of 433.743 MiB/s, a maximum of 434.863 MiB/s.
++The average is 433.338 MiB/s and the standard deviation is 0.595 MiB/s.
++The 95% confidence interval is [431.55, 435.12].
++
++chacha20poly1305 decryption of 512 bytes with a minimum of 428.914 MiB/s, a lower quartile of 429.878 MiB/s, a median of 430.119 MiB/s, a upper quartile of 430.385 MiB/s, a maximum of 431.197 MiB/s.
++The average is 430.137 MiB/s and the standard deviation is 0.354 MiB/s.
++The 95% confidence interval is [429.08, 431.20].
++
++chacha20poly1305 encryption of 8192 bytes with a minimum of 737.296 MiB/s, a lower quartile of 738.790 MiB/s, a median of 739.864 MiB/s, a upper quartile of 740.405 MiB/s, a maximum of 742.082 MiB/s.
++The average is 739.656 MiB/s and the standard deviation is 0.990 MiB/s.
++The 95% confidence interval is [736.69, 742.63].
++
++chacha20poly1305 decryption of 8192 bytes with a minimum of 734.709 MiB/s, a lower quartile of 739.074 MiB/s, a median of 740.188 MiB/s, a upper quartile of 740.714 MiB/s, a maximum of 741.712 MiB/s.
++The average is 739.937 MiB/s and the standard deviation is 0.991 MiB/s.
++The 95% confidence interval is [736.96, 742.91].
++
++chacha20poly1305 encryption of 16384 bytes with a minimum of 752.905 MiB/s, a lower quartile of 757.275 MiB/s, a median of 758.359 MiB/s, a upper quartile of 758.744 MiB/s, a maximum of 759.973 MiB/s.
++The average is 758.069 MiB/s and the standard deviation is 0.914 MiB/s.
++The 95% confidence interval is [755.33, 760.81].
++
++chacha20poly1305 decryption of 16384 bytes with a minimum of 755.358 MiB/s, a lower quartile of 757.707 MiB/s, a median of 758.838 MiB/s, a upper quartile of 759.193 MiB/s, a maximum of 760.590 MiB/s.
++The average is 758.535 MiB/s and the standard deviation is 0.899 MiB/s.
++The 95% confidence interval is [755.84, 761.23].
++
++
++chacha20poly1305psiv encryption of 2 bytes with a minimum of 3.233 MiB/s, a lower quartile of 3.286 MiB/s, a median of 3.286 MiB/s, a upper quartile of 3.287 MiB/s, a maximum of 3.288 MiB/s.
++The average is 3.286 MiB/s and the standard deviation is 0.002 MiB/s.
++The 95% confidence interval is [3.28, 3.29].
++
++chacha20poly1305psiv decryption of 2 bytes with a minimum of 3.279 MiB/s, a lower quartile of 3.281 MiB/s, a median of 3.282 MiB/s, a upper quartile of 3.282 MiB/s, a maximum of 3.284 MiB/s.
++The average is 3.282 MiB/s and the standard deviation is 0.001 MiB/s.
++The 95% confidence interval is [3.28, 3.28].
++
++chacha20poly1305psiv encryption of 32 bytes with a minimum of 50.091 MiB/s, a lower quartile of 50.137 MiB/s, a median of 50.150 MiB/s, a upper quartile of 50.163 MiB/s, a maximum of 50.208 MiB/s.
++The average is 50.150 MiB/s and the standard deviation is 0.019 MiB/s.
++The 95% confidence interval is [50.09, 50.21].
++
++chacha20poly1305psiv decryption of 32 bytes with a minimum of 49.711 MiB/s, a lower quartile of 50.051 MiB/s, a median of 50.125 MiB/s, a upper quartile of 50.177 MiB/s, a maximum of 50.248 MiB/s.
++The average is 50.104 MiB/s and the standard deviation is 0.092 MiB/s.
++The 95% confidence interval is [49.83, 50.38].
++
++chacha20poly1305psiv encryption of 512 bytes with a minimum of 430.118 MiB/s, a lower quartile of 433.050 MiB/s, a median of 433.342 MiB/s, a upper quartile of 433.638 MiB/s, a maximum of 435.182 MiB/s.
++The average is 433.356 MiB/s and the standard deviation is 0.459 MiB/s.
++The 95% confidence interval is [431.98, 434.73].
++
++chacha20poly1305psiv decryption of 512 bytes with a minimum of 424.257 MiB/s, a lower quartile of 425.431 MiB/s, a median of 425.697 MiB/s, a upper quartile of 425.965 MiB/s, a maximum of 427.029 MiB/s.
++The average is 425.704 MiB/s and the standard deviation is 0.386 MiB/s.
++The 95% confidence interval is [424.55, 426.86].
++
++chacha20poly1305psiv encryption of 8192 bytes with a minimum of 731.820 MiB/s, a lower quartile of 738.081 MiB/s, a median of 738.934 MiB/s, a upper quartile of 739.501 MiB/s, a maximum of 741.009 MiB/s.
++The average is 738.781 MiB/s and the standard deviation is 0.961 MiB/s.
++The 95% confidence interval is [735.90, 741.67].
++
++chacha20poly1305psiv decryption of 8192 bytes with a minimum of 732.466 MiB/s, a lower quartile of 737.111 MiB/s, a median of 738.053 MiB/s, a upper quartile of 738.566 MiB/s, a maximum of 740.019 MiB/s.
++The average is 737.854 MiB/s and the standard deviation is 0.916 MiB/s.
++The 95% confidence interval is [735.11, 740.60].
++
++chacha20poly1305psiv encryption of 16384 bytes with a minimum of 752.559 MiB/s, a lower quartile of 757.165 MiB/s, a median of 758.212 MiB/s, a upper quartile of 758.626 MiB/s, a maximum of 759.710 MiB/s.
++The average is 757.924 MiB/s and the standard deviation is 0.954 MiB/s.
++The 95% confidence interval is [755.06, 760.79].
++
++chacha20poly1305psiv decryption of 16384 bytes with a minimum of 753.359 MiB/s, a lower quartile of 757.544 MiB/s, a median of 758.626 MiB/s, a upper quartile of 759.020 MiB/s, a maximum of 760.042 MiB/s.
++The average is 758.342 MiB/s and the standard deviation is 0.924 MiB/s.
++The 95% confidence interval is [755.57, 761.11].
++
+diff --git a/performance_measurements/results/zen2.txt b/performance_measurements/results/zen2.txt
+new file mode 100644
+index 00000000..18aa69ff
+--- /dev/null
++++ b/performance_measurements/results/zen2.txt
+@@ -0,0 +1,383 @@
++chacha20 of 2 bytes message and 0 bytes AD with a minimum of 10.150 MiB/s, a lower quartile of 10.161 MiB/s, a median of 10.162 MiB/s, a upper quartile of 10.162 MiB/s, a maximum of 10.165 MiB/s.
++The average is 10.161 MiB/s and the standard deviation is 0.002 MiB/s.
++The 95% confidence interval is [10.15, 10.17].
++
++chacha20 of 32 bytes message and 0 bytes AD with a minimum of 135.479 MiB/s, a lower quartile of 135.984 MiB/s, a median of 135.999 MiB/s, a upper quartile of 136.000 MiB/s, a maximum of 136.460 MiB/s.
++The average is 135.987 MiB/s and the standard deviation is 0.169 MiB/s.
++The 95% confidence interval is [135.48, 136.49].
++
++chacha20 of 512 bytes message and 0 bytes AD with a minimum of 1044.395 MiB/s, a lower quartile of 1048.960 MiB/s, a median of 1049.523 MiB/s, a upper quartile of 1049.944 MiB/s, a maximum of 1051.026 MiB/s.
++The average is 1049.512 MiB/s and the standard deviation is 1.098 MiB/s.
++The 95% confidence interval is [1046.22, 1052.81].
++
++chacha20 of 8192 bytes message and 0 bytes AD with a minimum of 1098.728 MiB/s, a lower quartile of 1100.581 MiB/s, a median of 1101.335 MiB/s, a upper quartile of 1102.052 MiB/s, a maximum of 1103.881 MiB/s.
++The average is 1101.306 MiB/s and the standard deviation is 1.101 MiB/s.
++The 95% confidence interval is [1098.00, 1104.61].
++
++chacha20 of 16384 bytes message and 0 bytes AD with a minimum of 1102.452 MiB/s, a lower quartile of 1103.124 MiB/s, a median of 1103.916 MiB/s, a upper quartile of 1104.076 MiB/s, a maximum of 1104.405 MiB/s.
++The average is 1103.683 MiB/s and the standard deviation is 0.549 MiB/s.
++The 95% confidence interval is [1102.04, 1105.33].
++
++
++aes256gcm encryption of 2 bytes message and 2 bytes AD with a minimum of 6.545 MiB/s, a lower quartile of 6.557 MiB/s, a median of 6.561 MiB/s, a upper quartile of 6.572 MiB/s, a maximum of 6.601 MiB/s.
++The average is 6.565 MiB/s and the standard deviation is 0.010 MiB/s.
++The 95% confidence interval is [6.54, 6.59].
++
++aes256gcm decryption of 2 bytes message and 2 bytes AD with a minimum of 6.774 MiB/s, a lower quartile of 6.775 MiB/s, a median of 6.775 MiB/s, a upper quartile of 6.775 MiB/s, a maximum of 6.779 MiB/s.
++The average is 6.775 MiB/s and the standard deviation is 0.001 MiB/s.
++The 95% confidence interval is [6.77, 6.78].
++
++aes256gcm encryption of 2 bytes message and 32 bytes AD with a minimum of 6.655 MiB/s, a lower quartile of 6.730 MiB/s, a median of 6.735 MiB/s, a upper quartile of 6.739 MiB/s, a maximum of 6.755 MiB/s.
++The average is 6.733 MiB/s and the standard deviation is 0.015 MiB/s.
++The 95% confidence interval is [6.69, 6.78].
++
++aes256gcm decryption of 2 bytes message and 32 bytes AD with a minimum of 6.798 MiB/s, a lower quartile of 6.882 MiB/s, a median of 6.906 MiB/s, a upper quartile of 6.907 MiB/s, a maximum of 6.909 MiB/s.
++The average is 6.892 MiB/s and the standard deviation is 0.025 MiB/s.
++The 95% confidence interval is [6.82, 6.97].
++
++aes256gcm encryption of 2 bytes message and 512 bytes AD with a minimum of 4.109 MiB/s, a lower quartile of 4.109 MiB/s, a median of 4.109 MiB/s, a upper quartile of 4.109 MiB/s, a maximum of 4.155 MiB/s.
++The average is 4.111 MiB/s and the standard deviation is 0.006 MiB/s.
++The 95% confidence interval is [4.09, 4.13].
++
++aes256gcm decryption of 2 bytes message and 512 bytes AD with a minimum of 4.167 MiB/s, a lower quartile of 4.190 MiB/s, a median of 4.190 MiB/s, a upper quartile of 4.190 MiB/s, a maximum of 4.190 MiB/s.
++The average is 4.189 MiB/s and the standard deviation is 0.003 MiB/s.
++The 95% confidence interval is [4.18, 4.20].
++
++aes256gcm encryption of 32 bytes message and 2 bytes AD with a minimum of 100.946 MiB/s, a lower quartile of 100.998 MiB/s, a median of 100.999 MiB/s, a upper quartile of 100.999 MiB/s, a maximum of 101.008 MiB/s.
++The average is 100.998 MiB/s and the standard deviation is 0.007 MiB/s.
++The 95% confidence interval is [100.98, 101.02].
++
++aes256gcm decryption of 32 bytes message and 2 bytes AD with a minimum of 103.166 MiB/s, a lower quartile of 103.217 MiB/s, a median of 103.340 MiB/s, a upper quartile of 103.419 MiB/s, a maximum of 103.803 MiB/s.
++The average is 103.351 MiB/s and the standard deviation is 0.139 MiB/s.
++The 95% confidence interval is [102.93, 103.77].
++
++aes256gcm encryption of 32 bytes message and 32 bytes AD with a minimum of 103.607 MiB/s, a lower quartile of 103.960 MiB/s, a median of 104.765 MiB/s, a upper quartile of 104.929 MiB/s, a maximum of 104.939 MiB/s.
++The average is 104.472 MiB/s and the standard deviation is 0.521 MiB/s.
++The 95% confidence interval is [102.91, 106.04].
++
++aes256gcm decryption of 32 bytes message and 32 bytes AD with a minimum of 103.410 MiB/s, a lower quartile of 104.314 MiB/s, a median of 104.578 MiB/s, a upper quartile of 104.794 MiB/s, a maximum of 104.805 MiB/s.
++The average is 104.492 MiB/s and the standard deviation is 0.365 MiB/s.
++The 95% confidence interval is [103.40, 105.59].
++
++aes256gcm encryption of 32 bytes message and 512 bytes AD with a minimum of 64.222 MiB/s, a lower quartile of 64.255 MiB/s, a median of 64.256 MiB/s, a upper quartile of 64.259 MiB/s, a maximum of 64.260 MiB/s.
++The average is 64.255 MiB/s and the standard deviation is 0.007 MiB/s.
++The 95% confidence interval is [64.24, 64.27].
++
++aes256gcm decryption of 32 bytes message and 512 bytes AD with a minimum of 64.673 MiB/s, a lower quartile of 64.710 MiB/s, a median of 64.710 MiB/s, a upper quartile of 64.713 MiB/s, a maximum of 64.714 MiB/s.
++The average is 64.710 MiB/s and the standard deviation is 0.006 MiB/s.
++The 95% confidence interval is [64.69, 64.73].
++
++aes256gcm encryption of 512 bytes message and 2 bytes AD with a minimum of 700.181 MiB/s, a lower quartile of 700.328 MiB/s, a median of 700.785 MiB/s, a upper quartile of 700.785 MiB/s, a maximum of 700.790 MiB/s.
++The average is 700.585 MiB/s and the standard deviation is 0.233 MiB/s.
++The 95% confidence interval is [699.89, 701.28].
++
++aes256gcm decryption of 512 bytes message and 2 bytes AD with a minimum of 657.208 MiB/s, a lower quartile of 657.294 MiB/s, a median of 657.689 MiB/s, a upper quartile of 657.693 MiB/s, a maximum of 657.698 MiB/s.
++The average is 657.506 MiB/s and the standard deviation is 0.204 MiB/s.
++The 95% confidence interval is [656.89, 658.12].
++
++aes256gcm encryption of 512 bytes message and 32 bytes AD with a minimum of 705.137 MiB/s, a lower quartile of 707.953 MiB/s, a median of 708.410 MiB/s, a upper quartile of 708.420 MiB/s, a maximum of 708.430 MiB/s.
++The average is 708.159 MiB/s and the standard deviation is 0.398 MiB/s.
++The 95% confidence interval is [706.96, 709.35].
++
++aes256gcm decryption of 512 bytes message and 32 bytes AD with a minimum of 654.360 MiB/s, a lower quartile of 657.191 MiB/s, a median of 657.200 MiB/s, a upper quartile of 660.076 MiB/s, a maximum of 661.288 MiB/s.
++The average is 658.229 MiB/s and the standard deviation is 1.807 MiB/s.
++The 95% confidence interval is [652.81, 663.65].
++
++aes256gcm encryption of 512 bytes message and 512 bytes AD with a minimum of 559.881 MiB/s, a lower quartile of 561.658 MiB/s, a median of 561.952 MiB/s, a upper quartile of 561.956 MiB/s, a maximum of 563.675 MiB/s.
++The average is 561.905 MiB/s and the standard deviation is 0.572 MiB/s.
++The 95% confidence interval is [560.19, 563.62].
++
++aes256gcm decryption of 512 bytes message and 512 bytes AD with a minimum of 530.496 MiB/s, a lower quartile of 531.782 MiB/s, a median of 531.785 MiB/s, a upper quartile of 532.040 MiB/s, a maximum of 532.046 MiB/s.
++The average is 531.851 MiB/s and the standard deviation is 0.248 MiB/s.
++The 95% confidence interval is [531.11, 532.59].
++
++aes256gcm encryption of 8192 bytes message and 2 bytes AD with a minimum of 875.636 MiB/s, a lower quartile of 879.231 MiB/s, a median of 879.928 MiB/s, a upper quartile of 879.982 MiB/s, a maximum of 881.622 MiB/s.
++The average is 879.895 MiB/s and the standard deviation is 0.814 MiB/s.
++The 95% confidence interval is [877.45, 882.34].
++
++aes256gcm decryption of 8192 bytes message and 2 bytes AD with a minimum of 796.814 MiB/s, a lower quartile of 800.341 MiB/s, a median of 800.880 MiB/s, a upper quartile of 800.886 MiB/s, a maximum of 800.969 MiB/s.
++The average is 800.626 MiB/s and the standard deviation is 0.478 MiB/s.
++The 95% confidence interval is [799.19, 802.06].
++
++aes256gcm encryption of 8192 bytes message and 32 bytes AD with a minimum of 876.281 MiB/s, a lower quartile of 880.130 MiB/s, a median of 880.790 MiB/s, a upper quartile of 880.813 MiB/s, a maximum of 880.844 MiB/s.
++The average is 880.509 MiB/s and the standard deviation is 0.553 MiB/s.
++The 95% confidence interval is [878.85, 882.17].
++
++aes256gcm decryption of 8192 bytes message and 32 bytes AD with a minimum of 800.680 MiB/s, a lower quartile of 801.516 MiB/s, a median of 802.012 MiB/s, a upper quartile of 802.038 MiB/s, a maximum of 807.162 MiB/s.
++The average is 801.969 MiB/s and the standard deviation is 0.737 MiB/s.
++The 95% confidence interval is [799.76, 804.18].
++
++aes256gcm encryption of 8192 bytes message and 512 bytes AD with a minimum of 860.745 MiB/s, a lower quartile of 861.116 MiB/s, a median of 861.496 MiB/s, a upper quartile of 861.517 MiB/s, a maximum of 862.627 MiB/s.
++The average is 861.414 MiB/s and the standard deviation is 0.407 MiB/s.
++The 95% confidence interval is [860.19, 862.63].
++
++aes256gcm decryption of 8192 bytes message and 512 bytes AD with a minimum of 785.946 MiB/s, a lower quartile of 786.157 MiB/s, a median of 786.627 MiB/s, a upper quartile of 786.671 MiB/s, a maximum of 788.349 MiB/s.
++The average is 786.599 MiB/s and the standard deviation is 0.553 MiB/s.
++The 95% confidence interval is [784.94, 788.26].
++
++aes256gcm encryption of 16384 bytes message and 2 bytes AD with a minimum of 884.559 MiB/s, a lower quartile of 885.517 MiB/s, a median of 886.035 MiB/s, a upper quartile of 886.335 MiB/s, a maximum of 886.799 MiB/s.
++The average is 885.907 MiB/s and the standard deviation is 0.510 MiB/s.
++The 95% confidence interval is [884.38, 887.44].
++
++aes256gcm decryption of 16384 bytes message and 2 bytes AD with a minimum of 804.566 MiB/s, a lower quartile of 807.763 MiB/s, a median of 808.221 MiB/s, a upper quartile of 808.798 MiB/s, a maximum of 810.735 MiB/s.
++The average is 808.264 MiB/s and the standard deviation is 0.899 MiB/s.
++The 95% confidence interval is [805.57, 810.96].
++
++aes256gcm encryption of 16384 bytes message and 32 bytes AD with a minimum of 884.896 MiB/s, a lower quartile of 885.573 MiB/s, a median of 885.918 MiB/s, a upper quartile of 886.343 MiB/s, a maximum of 887.312 MiB/s.
++The average is 885.935 MiB/s and the standard deviation is 0.477 MiB/s.
++The 95% confidence interval is [884.50, 887.37].
++
++aes256gcm decryption of 16384 bytes message and 32 bytes AD with a minimum of 805.429 MiB/s, a lower quartile of 807.888 MiB/s, a median of 808.600 MiB/s, a upper quartile of 809.262 MiB/s, a maximum of 812.973 MiB/s.
++The average is 808.607 MiB/s and the standard deviation is 1.262 MiB/s.
++The 95% confidence interval is [804.82, 812.39].
++
++aes256gcm encryption of 16384 bytes message and 512 bytes AD with a minimum of 875.912 MiB/s, a lower quartile of 876.619 MiB/s, a median of 877.013 MiB/s, a upper quartile of 877.368 MiB/s, a maximum of 878.225 MiB/s.
++The average is 877.024 MiB/s and the standard deviation is 0.515 MiB/s.
++The 95% confidence interval is [875.48, 878.57].
++
++aes256gcm decryption of 16384 bytes message and 512 bytes AD with a minimum of 797.317 MiB/s, a lower quartile of 800.231 MiB/s, a median of 800.861 MiB/s, a upper quartile of 801.259 MiB/s, a maximum of 803.115 MiB/s.
++The average is 800.719 MiB/s and the standard deviation is 0.826 MiB/s.
++The 95% confidence interval is [798.24, 803.20].
++
++
++chacha20poly1305 encryption of 2 bytes message and 2 bytes AD with a minimum of 3.135 MiB/s, a lower quartile of 3.140 MiB/s, a median of 3.142 MiB/s, a upper quartile of 3.142 MiB/s, a maximum of 3.143 MiB/s.
++The average is 3.141 MiB/s and the standard deviation is 0.002 MiB/s.
++The 95% confidence interval is [3.14, 3.15].
++
++chacha20poly1305 decryption of 2 bytes message and 2 bytes AD with a minimum of 3.015 MiB/s, a lower quartile of 3.016 MiB/s, a median of 3.017 MiB/s, a upper quartile of 3.026 MiB/s, a maximum of 3.068 MiB/s.
++The average is 3.022 MiB/s and the standard deviation is 0.011 MiB/s.
++The 95% confidence interval is [2.99, 3.06].
++
++chacha20poly1305 encryption of 2 bytes message and 32 bytes AD with a minimum of 2.946 MiB/s, a lower quartile of 2.966 MiB/s, a median of 2.966 MiB/s, a upper quartile of 2.969 MiB/s, a maximum of 2.985 MiB/s.
++The average is 2.968 MiB/s and the standard deviation is 0.007 MiB/s.
++The 95% confidence interval is [2.95, 2.99].
++
++chacha20poly1305 decryption of 2 bytes message and 32 bytes AD with a minimum of 2.867 MiB/s, a lower quartile of 2.900 MiB/s, a median of 2.903 MiB/s, a upper quartile of 2.905 MiB/s, a maximum of 2.920 MiB/s.
++The average is 2.902 MiB/s and the standard deviation is 0.007 MiB/s.
++The 95% confidence interval is [2.88, 2.92].
++
++chacha20poly1305 encryption of 2 bytes message and 512 bytes AD with a minimum of 1.919 MiB/s, a lower quartile of 1.932 MiB/s, a median of 1.936 MiB/s, a upper quartile of 1.940 MiB/s, a maximum of 1.952 MiB/s.
++The average is 0.584 MiB/s and the standard deviation is -nan MiB/s.
++The 95% confidence interval is [-nan, -nan].
++
++chacha20poly1305 decryption of 2 bytes message and 512 bytes AD with a minimum of 1.895 MiB/s, a lower quartile of 1.901 MiB/s, a median of 1.902 MiB/s, a upper quartile of 1.903 MiB/s, a maximum of 1.910 MiB/s.
++The average is 0.620 MiB/s and the standard deviation is -nan MiB/s.
++The 95% confidence interval is [-nan, -nan].
++
++chacha20poly1305 encryption of 32 bytes message and 2 bytes AD with a minimum of 41.806 MiB/s, a lower quartile of 41.824 MiB/s, a median of 41.825 MiB/s, a upper quartile of 41.825 MiB/s, a maximum of 41.825 MiB/s.
++The average is 41.823 MiB/s and the standard deviation is 0.004 MiB/s.
++The 95% confidence interval is [41.81, 41.83].
++
++chacha20poly1305 decryption of 32 bytes message and 2 bytes AD with a minimum of 42.101 MiB/s, a lower quartile of 42.141 MiB/s, a median of 42.141 MiB/s, a upper quartile of 42.173 MiB/s, a maximum of 42.960 MiB/s.
++The average is 42.184 MiB/s and the standard deviation is 0.140 MiB/s.
++The 95% confidence interval is [41.76, 42.61].
++
++chacha20poly1305 encryption of 32 bytes message and 32 bytes AD with a minimum of 40.995 MiB/s, a lower quartile of 41.010 MiB/s, a median of 41.011 MiB/s, a upper quartile of 41.012 MiB/s, a maximum of 41.166 MiB/s.
++The average is 41.030 MiB/s and the standard deviation is 0.047 MiB/s.
++The 95% confidence interval is [40.89, 41.17].
++
++chacha20poly1305 decryption of 32 bytes message and 32 bytes AD with a minimum of 41.578 MiB/s, a lower quartile of 41.819 MiB/s, a median of 41.841 MiB/s, a upper quartile of 41.869 MiB/s, a maximum of 42.126 MiB/s.
++The average is 41.841 MiB/s and the standard deviation is 0.100 MiB/s.
++The 95% confidence interval is [41.54, 42.14].
++
++chacha20poly1305 encryption of 32 bytes message and 512 bytes AD with a minimum of 27.968 MiB/s, a lower quartile of 28.144 MiB/s, a median of 28.187 MiB/s, a upper quartile of 28.231 MiB/s, a maximum of 28.349 MiB/s.
++The average is 28.182 MiB/s and the standard deviation is 0.085 MiB/s.
++The 95% confidence interval is [27.93, 28.44].
++
++chacha20poly1305 decryption of 32 bytes message and 512 bytes AD with a minimum of 28.208 MiB/s, a lower quartile of 28.312 MiB/s, a median of 28.380 MiB/s, a upper quartile of 28.422 MiB/s, a maximum of 28.458 MiB/s.
++The average is 28.365 MiB/s and the standard deviation is 0.070 MiB/s.
++The 95% confidence interval is [28.16, 28.57].
++
++chacha20poly1305 encryption of 512 bytes message and 2 bytes AD with a minimum of 361.378 MiB/s, a lower quartile of 362.096 MiB/s, a median of 362.100 MiB/s, a upper quartile of 362.106 MiB/s, a maximum of 362.229 MiB/s.
++The average is 362.107 MiB/s and the standard deviation is 0.110 MiB/s.
++The 95% confidence interval is [361.78, 362.44].
++
++chacha20poly1305 decryption of 512 bytes message and 2 bytes AD with a minimum of 362.834 MiB/s, a lower quartile of 362.970 MiB/s, a median of 363.815 MiB/s, a upper quartile of 364.226 MiB/s, a maximum of 364.476 MiB/s.
++The average is 363.668 MiB/s and the standard deviation is 0.589 MiB/s.
++The 95% confidence interval is [361.90, 365.43].
++
++chacha20poly1305 encryption of 512 bytes message and 32 bytes AD with a minimum of 359.866 MiB/s, a lower quartile of 360.288 MiB/s, a median of 360.465 MiB/s, a upper quartile of 362.609 MiB/s, a maximum of 362.899 MiB/s.
++The average is 361.267 MiB/s and the standard deviation is 1.157 MiB/s.
++The 95% confidence interval is [357.80, 364.74].
++
++chacha20poly1305 decryption of 512 bytes message and 32 bytes AD with a minimum of 359.295 MiB/s, a lower quartile of 360.907 MiB/s, a median of 360.910 MiB/s, a upper quartile of 360.914 MiB/s, a maximum of 361.032 MiB/s.
++The average is 360.911 MiB/s and the standard deviation is 0.170 MiB/s.
++The 95% confidence interval is [360.40, 361.42].
++
++chacha20poly1305 encryption of 512 bytes message and 512 bytes AD with a minimum of 286.038 MiB/s, a lower quartile of 286.984 MiB/s, a median of 287.002 MiB/s, a upper quartile of 287.474 MiB/s, a maximum of 288.782 MiB/s.
++The average is 287.225 MiB/s and the standard deviation is 0.537 MiB/s.
++The 95% confidence interval is [285.61, 288.84].
++
++chacha20poly1305 decryption of 512 bytes message and 512 bytes AD with a minimum of 289.229 MiB/s, a lower quartile of 289.818 MiB/s, a median of 289.830 MiB/s, a upper quartile of 290.217 MiB/s, a maximum of 290.508 MiB/s.
++The average is 290.011 MiB/s and the standard deviation is 0.313 MiB/s.
++The 95% confidence interval is [289.07, 290.95].
++
++chacha20poly1305 encryption of 8192 bytes message and 2 bytes AD with a minimum of 588.967 MiB/s, a lower quartile of 590.850 MiB/s, a median of 591.382 MiB/s, a upper quartile of 593.633 MiB/s, a maximum of 595.247 MiB/s.
++The average is 592.032 MiB/s and the standard deviation is 1.432 MiB/s.
++The 95% confidence interval is [587.74, 596.33].
++
++chacha20poly1305 decryption of 8192 bytes message and 2 bytes AD with a minimum of 588.297 MiB/s, a lower quartile of 590.301 MiB/s, a median of 590.595 MiB/s, a upper quartile of 591.610 MiB/s, a maximum of 593.587 MiB/s.
++The average is 590.979 MiB/s and the standard deviation is 1.031 MiB/s.
++The 95% confidence interval is [587.89, 594.07].
++
++chacha20poly1305 encryption of 8192 bytes message and 32 bytes AD with a minimum of 589.799 MiB/s, a lower quartile of 590.221 MiB/s, a median of 590.535 MiB/s, a upper quartile of 590.909 MiB/s, a maximum of 593.357 MiB/s.
++The average is 590.701 MiB/s and the standard deviation is 0.702 MiB/s.
++The 95% confidence interval is [588.59, 592.81].
++
++chacha20poly1305 decryption of 8192 bytes message and 32 bytes AD with a minimum of 589.590 MiB/s, a lower quartile of 590.071 MiB/s, a median of 591.004 MiB/s, a upper quartile of 592.568 MiB/s, a maximum of 593.524 MiB/s.
++The average is 591.338 MiB/s and the standard deviation is 1.284 MiB/s.
++The 95% confidence interval is [587.49, 595.19].
++
++chacha20poly1305 encryption of 8192 bytes message and 512 bytes AD with a minimum of 574.363 MiB/s, a lower quartile of 576.340 MiB/s, a median of 577.019 MiB/s, a upper quartile of 577.430 MiB/s, a maximum of 578.763 MiB/s.
++The average is 576.795 MiB/s and the standard deviation is 1.084 MiB/s.
++The 95% confidence interval is [573.54, 580.05].
++
++chacha20poly1305 decryption of 8192 bytes message and 512 bytes AD with a minimum of 574.790 MiB/s, a lower quartile of 577.945 MiB/s, a median of 578.532 MiB/s, a upper quartile of 579.135 MiB/s, a maximum of 580.479 MiB/s.
++The average is 578.531 MiB/s and the standard deviation is 0.977 MiB/s.
++The 95% confidence interval is [575.60, 581.46].
++
++chacha20poly1305 encryption of 16384 bytes message and 2 bytes AD with a minimum of 603.219 MiB/s, a lower quartile of 603.945 MiB/s, a median of 605.502 MiB/s, a upper quartile of 605.896 MiB/s, a maximum of 606.710 MiB/s.
++The average is 605.131 MiB/s and the standard deviation is 1.044 MiB/s.
++The 95% confidence interval is [602.00, 608.26].
++
++chacha20poly1305 decryption of 16384 bytes message and 2 bytes AD with a minimum of 602.756 MiB/s, a lower quartile of 603.445 MiB/s, a median of 603.577 MiB/s, a upper quartile of 603.890 MiB/s, a maximum of 604.377 MiB/s.
++The average is 603.612 MiB/s and the standard deviation is 0.342 MiB/s.
++The 95% confidence interval is [602.59, 604.64].
++
++chacha20poly1305 encryption of 16384 bytes message and 32 bytes AD with a minimum of 603.985 MiB/s, a lower quartile of 605.099 MiB/s, a median of 605.554 MiB/s, a upper quartile of 605.815 MiB/s, a maximum of 606.433 MiB/s.
++The average is 605.469 MiB/s and the standard deviation is 0.531 MiB/s.
++The 95% confidence interval is [603.87, 607.06].
++
++chacha20poly1305 decryption of 16384 bytes message and 32 bytes AD with a minimum of 602.797 MiB/s, a lower quartile of 604.501 MiB/s, a median of 606.050 MiB/s, a upper quartile of 606.950 MiB/s, a maximum of 607.444 MiB/s.
++The average is 605.819 MiB/s and the standard deviation is 1.264 MiB/s.
++The 95% confidence interval is [602.03, 609.61].
++
++chacha20poly1305 encryption of 16384 bytes message and 512 bytes AD with a minimum of 594.372 MiB/s, a lower quartile of 595.638 MiB/s, a median of 597.124 MiB/s, a upper quartile of 597.886 MiB/s, a maximum of 598.596 MiB/s.
++The average is 596.807 MiB/s and the standard deviation is 1.251 MiB/s.
++The 95% confidence interval is [593.06, 600.56].
++
++chacha20poly1305 decryption of 16384 bytes message and 512 bytes AD with a minimum of 597.006 MiB/s, a lower quartile of 598.337 MiB/s, a median of 598.542 MiB/s, a upper quartile of 598.887 MiB/s, a maximum of 599.120 MiB/s.
++The average is 598.497 MiB/s and the standard deviation is 0.469 MiB/s.
++The 95% confidence interval is [597.09, 599.90].
++
++
++chacha20poly1305psiv encryption of 2 bytes message and 2 bytes AD with a minimum of 2.728 MiB/s, a lower quartile of 2.734 MiB/s, a median of 2.736 MiB/s, a upper quartile of 2.738 MiB/s, a maximum of 2.742 MiB/s.
++The average is 2.736 MiB/s and the standard deviation is 0.003 MiB/s.
++The 95% confidence interval is [2.73, 2.74].
++
++chacha20poly1305psiv decryption of 2 bytes message and 2 bytes AD with a minimum of 2.758 MiB/s, a lower quartile of 2.771 MiB/s, a median of 2.771 MiB/s, a upper quartile of 2.772 MiB/s, a maximum of 2.783 MiB/s.
++The average is 2.772 MiB/s and the standard deviation is 0.003 MiB/s.
++The 95% confidence interval is [2.76, 2.78].
++
++chacha20poly1305psiv encryption of 2 bytes message and 32 bytes AD with a minimum of 2.912 MiB/s, a lower quartile of 2.916 MiB/s, a median of 2.919 MiB/s, a upper quartile of 2.921 MiB/s, a maximum of 2.925 MiB/s.
++The average is 2.919 MiB/s and the standard deviation is 0.003 MiB/s.
++The 95% confidence interval is [2.91, 2.93].
++
++chacha20poly1305psiv decryption of 2 bytes message and 32 bytes AD with a minimum of 2.801 MiB/s, a lower quartile of 2.860 MiB/s, a median of 2.863 MiB/s, a upper quartile of 2.865 MiB/s, a maximum of 2.877 MiB/s.
++The average is 2.859 MiB/s and the standard deviation is 0.015 MiB/s.
++The 95% confidence interval is [2.81, 2.90].
++
++chacha20poly1305psiv encryption of 2 bytes message and 512 bytes AD with a minimum of 1.654 MiB/s, a lower quartile of 1.867 MiB/s, a median of 1.871 MiB/s, a upper quartile of 1.899 MiB/s, a maximum of 1.907 MiB/s.
++The average is 0.654 MiB/s and the standard deviation is -nan MiB/s.
++The 95% confidence interval is [-nan, -nan].
++
++chacha20poly1305psiv decryption of 2 bytes message and 512 bytes AD with a minimum of 1.844 MiB/s, a lower quartile of 1.847 MiB/s, a median of 1.849 MiB/s, a upper quartile of 1.851 MiB/s, a maximum of 1.862 MiB/s.
++The average is 0.671 MiB/s and the standard deviation is -nan MiB/s.
++The 95% confidence interval is [-nan, -nan].
++
++chacha20poly1305psiv encryption of 32 bytes message and 2 bytes AD with a minimum of 41.800 MiB/s, a lower quartile of 42.392 MiB/s, a median of 42.591 MiB/s, a upper quartile of 42.701 MiB/s, a maximum of 42.854 MiB/s.
++The average is 42.506 MiB/s and the standard deviation is 0.273 MiB/s.
++The 95% confidence interval is [41.69, 43.32].
++
++chacha20poly1305psiv decryption of 32 bytes message and 2 bytes AD with a minimum of 41.217 MiB/s, a lower quartile of 41.830 MiB/s, a median of 41.918 MiB/s, a upper quartile of 41.992 MiB/s, a maximum of 42.098 MiB/s.
++The average is 41.862 MiB/s and the standard deviation is 0.203 MiB/s.
++The 95% confidence interval is [41.25, 42.47].
++
++chacha20poly1305psiv encryption of 32 bytes message and 32 bytes AD with a minimum of 42.022 MiB/s, a lower quartile of 42.308 MiB/s, a median of 42.821 MiB/s, a upper quartile of 42.865 MiB/s, a maximum of 42.878 MiB/s.
++The average is 42.631 MiB/s and the standard deviation is 0.291 MiB/s.
++The 95% confidence interval is [41.76, 43.50].
++
++chacha20poly1305psiv decryption of 32 bytes message and 32 bytes AD with a minimum of 41.374 MiB/s, a lower quartile of 42.114 MiB/s, a median of 42.269 MiB/s, a upper quartile of 42.508 MiB/s, a maximum of 42.555 MiB/s.
++The average is 42.282 MiB/s and the standard deviation is 0.252 MiB/s.
++The 95% confidence interval is [41.53, 43.04].
++
++chacha20poly1305psiv encryption of 32 bytes message and 512 bytes AD with a minimum of 28.288 MiB/s, a lower quartile of 28.666 MiB/s, a median of 28.709 MiB/s, a upper quartile of 28.755 MiB/s, a maximum of 29.147 MiB/s.
++The average is 28.705 MiB/s and the standard deviation is 0.149 MiB/s.
++The 95% confidence interval is [28.26, 29.15].
++
++chacha20poly1305psiv decryption of 32 bytes message and 512 bytes AD with a minimum of 27.906 MiB/s, a lower quartile of 28.267 MiB/s, a median of 28.311 MiB/s, a upper quartile of 28.328 MiB/s, a maximum of 28.368 MiB/s.
++The average is 28.289 MiB/s and the standard deviation is 0.071 MiB/s.
++The 95% confidence interval is [28.08, 28.50].
++
++chacha20poly1305psiv encryption of 512 bytes message and 2 bytes AD with a minimum of 352.320 MiB/s, a lower quartile of 354.204 MiB/s, a median of 354.912 MiB/s, a upper quartile of 355.194 MiB/s, a maximum of 356.158 MiB/s.
++The average is 354.650 MiB/s and the standard deviation is 0.800 MiB/s.
++The 95% confidence interval is [352.25, 357.05].
++
++chacha20poly1305psiv decryption of 512 bytes message and 2 bytes AD with a minimum of 348.550 MiB/s, a lower quartile of 351.405 MiB/s, a median of 351.767 MiB/s, a upper quartile of 352.627 MiB/s, a maximum of 354.901 MiB/s.
++The average is 351.990 MiB/s and the standard deviation is 0.979 MiB/s.
++The 95% confidence interval is [349.05, 354.93].
++
++chacha20poly1305psiv encryption of 512 bytes message and 32 bytes AD with a minimum of 366.055 MiB/s, a lower quartile of 366.700 MiB/s, a median of 366.842 MiB/s, a upper quartile of 367.472 MiB/s, a maximum of 368.013 MiB/s.
++The average is 367.041 MiB/s and the standard deviation is 0.503 MiB/s.
++The 95% confidence interval is [365.53, 368.55].
++
++chacha20poly1305psiv decryption of 512 bytes message and 32 bytes AD with a minimum of 360.251 MiB/s, a lower quartile of 361.821 MiB/s, a median of 362.372 MiB/s, a upper quartile of 362.696 MiB/s, a maximum of 363.573 MiB/s.
++The average is 362.320 MiB/s and the standard deviation is 0.634 MiB/s.
++The 95% confidence interval is [360.42, 364.22].
++
++chacha20poly1305psiv encryption of 512 bytes message and 512 bytes AD with a minimum of 289.438 MiB/s, a lower quartile of 291.208 MiB/s, a median of 291.855 MiB/s, a upper quartile of 291.949 MiB/s, a maximum of 292.005 MiB/s.
++The average is 291.543 MiB/s and the standard deviation is 0.590 MiB/s.
++The 95% confidence interval is [289.77, 293.31].
++
++chacha20poly1305psiv decryption of 512 bytes message and 512 bytes AD with a minimum of 290.122 MiB/s, a lower quartile of 290.400 MiB/s, a median of 291.031 MiB/s, a upper quartile of 291.692 MiB/s, a maximum of 294.450 MiB/s.
++The average is 291.103 MiB/s and the standard deviation is 0.770 MiB/s.
++The 95% confidence interval is [288.79, 293.41].
++
++chacha20poly1305psiv encryption of 8192 bytes message and 2 bytes AD with a minimum of 588.537 MiB/s, a lower quartile of 589.757 MiB/s, a median of 590.371 MiB/s, a upper quartile of 591.627 MiB/s, a maximum of 593.513 MiB/s.
++The average is 590.690 MiB/s and the standard deviation is 1.187 MiB/s.
++The 95% confidence interval is [587.13, 594.25].
++
++chacha20poly1305psiv decryption of 8192 bytes message and 2 bytes AD with a minimum of 586.000 MiB/s, a lower quartile of 588.759 MiB/s, a median of 589.904 MiB/s, a upper quartile of 591.042 MiB/s, a maximum of 592.776 MiB/s.
++The average is 589.904 MiB/s and the standard deviation is 1.419 MiB/s.
++The 95% confidence interval is [585.65, 594.16].
++
++chacha20poly1305psiv encryption of 8192 bytes message and 32 bytes AD with a minimum of 460.504 MiB/s, a lower quartile of 592.122 MiB/s, a median of 593.499 MiB/s, a upper quartile of 594.089 MiB/s, a maximum of 595.663 MiB/s.
++The average is 590.418 MiB/s and the standard deviation is 22.857 MiB/s.
++The 95% confidence interval is [521.85, 658.99].
++
++chacha20poly1305psiv decryption of 8192 bytes message and 32 bytes AD with a minimum of 590.183 MiB/s, a lower quartile of 590.843 MiB/s, a median of 591.308 MiB/s, a upper quartile of 591.841 MiB/s, a maximum of 593.368 MiB/s.
++The average is 591.371 MiB/s and the standard deviation is 0.647 MiB/s.
++The 95% confidence interval is [589.43, 593.31].
++
++chacha20poly1305psiv encryption of 8192 bytes message and 512 bytes AD with a minimum of 574.096 MiB/s, a lower quartile of 575.144 MiB/s, a median of 575.931 MiB/s, a upper quartile of 576.923 MiB/s, a maximum of 578.421 MiB/s.
++The average is 576.086 MiB/s and the standard deviation is 1.054 MiB/s.
++The 95% confidence interval is [572.92, 579.25].
++
++chacha20poly1305psiv decryption of 8192 bytes message and 512 bytes AD with a minimum of 575.416 MiB/s, a lower quartile of 576.433 MiB/s, a median of 577.751 MiB/s, a upper quartile of 578.306 MiB/s, a maximum of 580.176 MiB/s.
++The average is 577.565 MiB/s and the standard deviation is 1.086 MiB/s.
++The 95% confidence interval is [574.31, 580.82].
++
++chacha20poly1305psiv encryption of 16384 bytes message and 2 bytes AD with a minimum of 603.252 MiB/s, a lower quartile of 604.494 MiB/s, a median of 604.677 MiB/s, a upper quartile of 605.128 MiB/s, a maximum of 606.010 MiB/s.
++The average is 604.771 MiB/s and the standard deviation is 0.467 MiB/s.
++The 95% confidence interval is [603.37, 606.17].
++
++chacha20poly1305psiv decryption of 16384 bytes message and 2 bytes AD with a minimum of 601.746 MiB/s, a lower quartile of 604.260 MiB/s, a median of 605.110 MiB/s, a upper quartile of 605.591 MiB/s, a maximum of 606.187 MiB/s.
++The average is 604.920 MiB/s and the standard deviation is 0.816 MiB/s.
++The 95% confidence interval is [602.47, 607.37].
++
++chacha20poly1305psiv encryption of 16384 bytes message and 32 bytes AD with a minimum of 604.103 MiB/s, a lower quartile of 604.864 MiB/s, a median of 605.624 MiB/s, a upper quartile of 605.910 MiB/s, a maximum of 606.515 MiB/s.
++The average is 605.483 MiB/s and the standard deviation is 0.622 MiB/s.
++The 95% confidence interval is [603.62, 607.35].
++
++chacha20poly1305psiv decryption of 16384 bytes message and 32 bytes AD with a minimum of 604.395 MiB/s, a lower quartile of 604.941 MiB/s, a median of 605.590 MiB/s, a upper quartile of 606.470 MiB/s, a maximum of 607.648 MiB/s.
++The average is 605.674 MiB/s and the standard deviation is 0.831 MiB/s.
++The 95% confidence interval is [603.18, 608.17].
++
++chacha20poly1305psiv encryption of 16384 bytes message and 512 bytes AD with a minimum of 595.226 MiB/s, a lower quartile of 597.174 MiB/s, a median of 597.564 MiB/s, a upper quartile of 597.857 MiB/s, a maximum of 598.481 MiB/s.
++The average is 597.492 MiB/s and the standard deviation is 0.534 MiB/s.
++The 95% confidence interval is [595.89, 599.09].
++
++chacha20poly1305psiv decryption of 16384 bytes message and 512 bytes AD with a minimum of 595.912 MiB/s, a lower quartile of 598.133 MiB/s, a median of 598.528 MiB/s, a upper quartile of 599.153 MiB/s, a maximum of 599.581 MiB/s.
++The average is 598.506 MiB/s and the standard deviation is 0.823 MiB/s.
++The 95% confidence interval is [596.04, 600.97].
++
+diff --git a/performance_measurements/test.c b/performance_measurements/test.c
+new file mode 100644
+index 00000000..7ee23448
+--- /dev/null
++++ b/performance_measurements/test.c
+@@ -0,0 +1,199 @@
++#include <sodium.h>
++#include <math.h>
++#include "measure.h"
++
++#define MAX_MESSAGE_LEN 65536
++#define MAX_AD_LEN 65536
++#define MiB (1 << 20)
++#define SAMPLE_DATA_SIZE (1 << 20)
++#define NSAMPLES 100
++#define WARMUP 20
++#define NB_MESSAGE_LENGTHS 5
++#define NB_AD_LENGTHS 3
++
++const size_t message_lengths[NB_MESSAGE_LENGTHS] = {1 << 1, 1 << 5, 1 << 9, 1 << 13, 1 << 14};
++const size_t ad_lengths[NB_AD_LENGTHS] = {1 << 1, 1 << 5, 1 << 9};
++
++void print_test_statistics(struct statistics *stats, size_t message_length, size_t ad_length, char *name)
++{
++    double constant_factor = (SAMPLE_DATA_SIZE * stats->scaling_factor) / MiB;
++    double average_speed = constant_factor * (1 + stats->variance / pow(stats->average, 2)) / stats->average;
++    double standard_deviation_speed = constant_factor * sqrt(stats->variance) * sqrt((1 - stats->variance / pow(stats->average, 2))) / pow(stats->average, 2);
++    printf("%s of %d bytes message and %d bytes AD with "
++           "a minimum of %.3f MiB/s, "
++           "a lower quartile of %.3f MiB/s, "
++           "a median of %.3f MiB/s, "
++           "a upper quartile of %.3f MiB/s, "
++           "a maximum of %.3f MiB/s.\n"
++           "The average is %.3f MiB/s and the standard deviation is %.3f MiB/s.\n"
++           "The 95%% confidence interval is [%4.2f, %4.2f].\n\n",
++           name, message_length, ad_length, constant_factor / stats->maximum,
++           constant_factor / stats->upper_quartile,
++           constant_factor / stats->median,
++           constant_factor / stats->lower_quartile,
++           constant_factor / stats->minimum,
++           average_speed,
++           standard_deviation_speed,
++           average_speed - 3 * standard_deviation_speed,
++           average_speed + 3 * standard_deviation_speed);
++}
++
++void test_chacha20()
++{
++
++    unsigned char message[MAX_MESSAGE_LEN] = {0xab};
++    unsigned char nonce[crypto_stream_chacha20_NONCEBYTES] = {0};
++    unsigned char key[crypto_stream_chacha20_KEYBYTES] = {0};
++    unsigned char ciphertext[MAX_MESSAGE_LEN] = {0};
++
++    crypto_stream_chacha20_keygen(key);
++    randombytes(nonce, crypto_stream_chacha20_NONCEBYTES);
++
++    for (size_t j = 0; j < NB_MESSAGE_LENGTHS; j++)
++    {
++        {
++            struct statistics stats;
++            measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                    crypto_stream_chacha20_xor(ciphertext, message, message_lengths[j], nonce, key);
++                } });
++            print_test_statistics(&stats, message_lengths[j], 0, "chacha20");
++        }
++    }
++}
++
++void test_aes256gcm()
++{
++    unsigned char message[MAX_MESSAGE_LEN] = {0xab};
++    unsigned char message2[MAX_MESSAGE_LEN] = {0};
++    unsigned char ad[MAX_AD_LEN] = {0xad};
++    unsigned char nonce[crypto_aead_aes256gcm_NPUBBYTES] = {0};
++    unsigned char key[crypto_aead_aes256gcm_KEYBYTES] = {0};
++    unsigned char ciphertext[MAX_MESSAGE_LEN] = {0};
++    unsigned char mac[crypto_aead_aes256gcm_ABYTES] = {0};
++
++    crypto_aead_aes256gcm_keygen(key);
++    randombytes(nonce, crypto_aead_aes256gcm_NPUBBYTES);
++
++    CRYPTO_ALIGN(16)
++    crypto_aead_aes256gcm_state ctx;
++    crypto_aead_aes256gcm_beforenm(&ctx, key);
++
++    for (size_t j = 0; j < NB_MESSAGE_LENGTHS; j++)
++    {
++        for (size_t k = 0; k < NB_AD_LENGTHS; k++)
++        {
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_aes256gcm_encrypt_detached_afternm(ciphertext, mac, NULL, message, message_lengths[j], ad, ad_lengths[k], NULL, nonce, &ctx);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "aes256gcm encryption");
++            }
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_aes256gcm_decrypt_detached_afternm(message2, NULL, ciphertext, message_lengths[j], mac, ad, ad_lengths[k], nonce, &ctx);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "aes256gcm decryption");
++            }
++        }
++    }
++}
++
++void test_chacha20poly1305()
++{
++
++    unsigned char message[MAX_MESSAGE_LEN] = {0xab};
++    unsigned char message2[MAX_MESSAGE_LEN] = {0};
++    unsigned char ad[MAX_AD_LEN] = {0xad};
++    unsigned char nonce[crypto_aead_chacha20poly1305_NPUBBYTES] = {0};
++    unsigned char key[crypto_aead_chacha20poly1305_KEYBYTES] = {0};
++    unsigned char ciphertext[MAX_MESSAGE_LEN] = {0};
++    unsigned char mac[crypto_aead_chacha20poly1305_ABYTES] = {0};
++
++    crypto_aead_chacha20poly1305_keygen(key);
++    randombytes(nonce, crypto_aead_chacha20poly1305_NPUBBYTES);
++
++    for (size_t j = 0; j < NB_MESSAGE_LENGTHS; j++)
++    {
++        for (size_t k = 0; k < NB_AD_LENGTHS; k++)
++        {
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_chacha20poly1305_encrypt_detached(ciphertext, mac, NULL, message, message_lengths[j], ad, ad_lengths[k], NULL, nonce, key);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "chacha20poly1305 encryption");
++            }
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_chacha20poly1305_decrypt_detached(message2, NULL, ciphertext, message_lengths[j], mac, ad, ad_lengths[k], nonce, key);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "chacha20poly1305 decryption");
++            }
++        }
++    }
++}
++
++void test_chacha20poly1305psiv()
++{
++
++    unsigned char message[MAX_MESSAGE_LEN] = {0xab};
++    unsigned char message2[MAX_MESSAGE_LEN] = {0};
++    unsigned char ad[MAX_AD_LEN] = {0xad};
++    unsigned char nonce[crypto_aead_chacha20poly1305psiv_NPUBBYTES] = {0};
++    unsigned char key[crypto_aead_chacha20poly1305psiv_KEYBYTES] = {0};
++    unsigned char ciphertext[MAX_MESSAGE_LEN] = {0};
++    unsigned char mac[crypto_aead_chacha20poly1305psiv_ABYTES] = {0};
++
++    crypto_aead_chacha20poly1305psiv_keygen(key);
++    randombytes(nonce, crypto_aead_chacha20poly1305psiv_NPUBBYTES);
++
++    CRYPTO_ALIGN(16)
++    crypto_aead_chacha20poly1305psiv_state ctx;
++    crypto_aead_chacha20poly1305psiv_beforenm(&ctx, key);
++
++    for (size_t j = 0; j < NB_MESSAGE_LENGTHS; j++)
++    {
++        for (size_t k = 0; k < NB_AD_LENGTHS; k++)
++        {
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_chacha20poly1305psiv_encrypt_detached_afternm(ciphertext, mac, NULL, message, message_lengths[j], ad, ad_lengths[k], NULL, nonce, &ctx);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "chacha20poly1305psiv encryption");
++            }
++            {
++                struct statistics stats;
++                measure_everything(WARMUP, NSAMPLES, stats, {for (size_t i = 0; i < SAMPLE_DATA_SIZE/message_lengths[j]; i++)
++                {
++                   crypto_aead_chacha20poly1305psiv_decrypt_detached_afternm(message2, NULL, ciphertext, message_lengths[j], mac, ad, ad_lengths[k], nonce, &ctx);
++                } });
++                print_test_statistics(&stats, message_lengths[j], ad_lengths[k], "chacha20poly1305psiv decryption");
++            }
++        }
++    }
++}
++
++int main(void)
++{
++    if (sodium_init() == -1)
++        return -1;
++    test_chacha20();
++    puts("");
++    test_aes256gcm();
++    puts("");
++    test_chacha20poly1305();
++    puts("");
++    test_chacha20poly1305psiv();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/src/libsodium/crypto_aead/chacha20poly1305/sodium/aead_chacha20poly1305.c b/src/libsodium/crypto_aead/chacha20poly1305/sodium/aead_chacha20poly1305.c
+index c3540879..ee20276a 100644
+--- a/src/libsodium/crypto_aead/chacha20poly1305/sodium/aead_chacha20poly1305.c
++++ b/src/libsodium/crypto_aead/chacha20poly1305/sodium/aead_chacha20poly1305.c
+@@ -398,3 +398,336 @@ crypto_aead_chacha20poly1305_keygen(unsigned char k[crypto_aead_chacha20poly1305
+ {
+     randombytes_buf(k, crypto_aead_chacha20poly1305_KEYBYTES);
+ }
++
++/* -- ChaCha20-Poly1305-PSIV*/
++
++size_t crypto_aead_chacha20poly1305psiv_keybytes(void){
++    return crypto_aead_chacha20poly1305psiv_KEYBYTES;
++}
++
++size_t crypto_aead_chacha20poly1305psiv_nsecbytes(void){
++    return crypto_aead_chacha20poly1305psiv_NSECBYTES;
++}
++
++size_t crypto_aead_chacha20poly1305psiv_npubbytes(void){
++    return crypto_aead_chacha20poly1305psiv_NPUBBYTES;
++}
++
++size_t crypto_aead_chacha20poly1305psiv_abytes(void){
++    return crypto_aead_chacha20poly1305psiv_ABYTES;
++}
++
++size_t crypto_aead_chacha20poly1305psiv_messagebytes_max(void){
++    return crypto_aead_chacha20poly1305psiv_MESSAGEBYTES_MAX;
++}
++
++size_t crypto_aead_chacha20poly1305psiv_statebytes(void)
++{
++    return (sizeof(crypto_aead_chacha20poly1305psiv_state) + (size_t) 15U) & ~(size_t) 15U;
++}
++
++int crypto_aead_chacha20poly1305psiv_encrypt(unsigned char *c,
++                                  unsigned long long *clen_p,
++                                  const unsigned char *m,
++                                  unsigned long long mlen,
++                                  const unsigned char *ad,
++                                  unsigned long long adlen,
++                                  const unsigned char *nsec,
++                                  const unsigned char *npub,
++                                  const unsigned char *k)
++{
++    CRYPTO_ALIGN(16) crypto_aead_chacha20poly1305psiv_state ctx;
++
++    crypto_aead_chacha20poly1305psiv_beforenm(&ctx, k);
++
++    int ret = crypto_aead_chacha20poly1305psiv_encrypt_afternm
++        (c, clen_p, m, mlen, ad, adlen, nsec, npub,
++            (const crypto_aead_chacha20poly1305psiv_state *) &ctx);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return ret;
++};
++
++int crypto_aead_chacha20poly1305psiv_decrypt(unsigned char *m,
++                                  unsigned long long *mlen_p,
++                                  unsigned char *nsec,
++                                  const unsigned char *c,
++                                  unsigned long long clen,
++                                  const unsigned char *ad,
++                                  unsigned long long adlen,
++                                  const unsigned char *npub,
++                                  const unsigned char *k)
++{
++    CRYPTO_ALIGN(16) crypto_aead_chacha20poly1305psiv_state ctx;
++
++    crypto_aead_chacha20poly1305psiv_beforenm(&ctx, k);
++
++    int ret = crypto_aead_chacha20poly1305psiv_decrypt_afternm
++        (m, mlen_p, nsec, c, clen, ad, adlen, npub,
++         (const crypto_aead_chacha20poly1305psiv_state *) &ctx);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return ret;
++}
++
++int crypto_aead_chacha20poly1305psiv_encrypt_detached(unsigned char *c,
++                                           unsigned char *mac,
++                                           unsigned long long *maclen_p,
++                                           const unsigned char *m,
++                                           unsigned long long mlen,
++                                           const unsigned char *ad,
++                                           unsigned long long adlen,
++                                           const unsigned char *nsec,
++                                           const unsigned char *npub,
++                                           const unsigned char *k)
++{
++    CRYPTO_ALIGN(16) crypto_aead_chacha20poly1305psiv_state ctx;
++
++    crypto_aead_chacha20poly1305psiv_beforenm(&ctx, k);
++
++    int ret = crypto_aead_chacha20poly1305psiv_encrypt_detached_afternm
++        (c, mac, maclen_p, m, mlen, ad, adlen, nsec, npub,
++            (const crypto_aead_chacha20poly1305psiv_state *) &ctx);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return ret;
++}
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_decrypt_detached(unsigned char *m,
++                                           unsigned char *nsec,
++                                           const unsigned char *c,
++                                           unsigned long long clen,
++                                           const unsigned char *mac,
++                                           const unsigned char *ad,
++                                           unsigned long long adlen,
++                                           const unsigned char *npub,
++                                           const unsigned char *k)
++{
++    CRYPTO_ALIGN(16) crypto_aead_chacha20poly1305psiv_state ctx;
++
++    crypto_aead_chacha20poly1305psiv_beforenm(&ctx, k);
++
++    int ret = crypto_aead_chacha20poly1305psiv_decrypt_detached_afternm
++        (m, nsec, c, clen, mac, ad, adlen, npub,
++            (const crypto_aead_chacha20poly1305psiv_state *) &ctx);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return ret;
++}
++
++
++// Precomputation interface
++
++typedef struct chacha20poly1305_state {
++    uint8_t tag_key[36], enc_key[36], poly1305_key[32];
++} chacha20poly1305_state;
++
++int crypto_aead_chacha20poly1305psiv_beforenm(crypto_aead_chacha20poly1305psiv_state *ctx_,
++                                   const unsigned char *key)
++{
++    chacha20poly1305_state *ctx = (chacha20poly1305_state *) (void *) ctx_;
++    COMPILER_ASSERT((sizeof *ctx_) >= (sizeof *ctx));
++    uint8_t poly1305_keygen_key[36];
++    poly1305_keygen_key[0] = key[0];
++    poly1305_keygen_key[1] = key[1];
++    poly1305_keygen_key[2] = key[2];
++    poly1305_keygen_key[3] = 0x03;
++    poly1305_keygen_key[4] = key[4];
++    poly1305_keygen_key[5] = key[5];
++    poly1305_keygen_key[6] = key[6];
++    poly1305_keygen_key[7] = 0x0c;
++    poly1305_keygen_key[8] = key[8];
++    poly1305_keygen_key[9] = key[9];
++    poly1305_keygen_key[10] = key[10];
++    poly1305_keygen_key[11] = 0x30;
++    poly1305_keygen_key[12] = key[3];
++    poly1305_keygen_key[13] = key[7];
++    poly1305_keygen_key[14] = key[11];
++    poly1305_keygen_key[15] = 0xc0;
++    poly1305_keygen_key[16] = key[12];
++    poly1305_keygen_key[17] = key[13];
++    poly1305_keygen_key[18] = key[14];
++    poly1305_keygen_key[19] = key[15];
++    poly1305_keygen_key[20] = key[16];
++    poly1305_keygen_key[21] = key[17];
++    poly1305_keygen_key[22] = key[18];
++    poly1305_keygen_key[23] = key[19];
++    poly1305_keygen_key[24] = key[20];
++    poly1305_keygen_key[25] = key[21];
++    poly1305_keygen_key[26] = key[22];
++    poly1305_keygen_key[27] = key[23];
++    poly1305_keygen_key[28] = key[24];
++    poly1305_keygen_key[29] = key[25];
++    poly1305_keygen_key[30] = key[26];
++    poly1305_keygen_key[31] = key[27];
++    poly1305_keygen_key[32] = key[28];
++    poly1305_keygen_key[33] = key[29];
++    poly1305_keygen_key[34] = key[30];
++    poly1305_keygen_key[35] = key[31];
++    
++    memcpy(ctx->tag_key, poly1305_keygen_key, 36);
++    memcpy(ctx->enc_key, poly1305_keygen_key, 36);
++    ctx->tag_key[3] = 0x5;
++    ctx->tag_key[7] = 0xa;
++    ctx->tag_key[11] = 0x50;
++    ctx->tag_key[15] = 0xa0;
++    ctx->enc_key[3] = 0x6;
++    ctx->enc_key[7] = 0x9;
++    ctx->enc_key[11] = 0x60;
++    ctx->enc_key[15] = 0x90;
++    uint8_t zero[16] = {0};
++    crypto_stream_chacha20_psiv(ctx->poly1305_key, 32, zero, poly1305_keygen_key, zero);
++
++    sodium_memzero(poly1305_keygen_key, 36);
++
++    return 0;
++}
++
++int crypto_aead_chacha20poly1305psiv_encrypt_afternm(unsigned char *c,
++                                          unsigned long long *clen_p,
++                                          const unsigned char *m,
++                                          unsigned long long mlen,
++                                          const unsigned char *ad,
++                                          unsigned long long adlen,
++                                          const unsigned char *nsec,
++                                          const unsigned char *npub,
++                                          const crypto_aead_chacha20poly1305psiv_state *ctx_)
++{
++    int ret = crypto_aead_chacha20poly1305psiv_encrypt_detached_afternm(c,
++                                                             c + mlen, NULL,
++                                                             m, mlen,
++                                                             ad, adlen,
++                                                             nsec, npub, ctx_);
++    if (clen_p != NULL) {
++        *clen_p = mlen + crypto_aead_chacha20poly1305psiv_ABYTES;
++    }
++    return ret;
++}
++
++int crypto_aead_chacha20poly1305psiv_decrypt_afternm(unsigned char *m,
++                                          unsigned long long *mlen_p,
++                                          unsigned char *nsec,
++                                          const unsigned char *c,
++                                          unsigned long long clen,
++                                          const unsigned char *ad,
++                                          unsigned long long adlen,
++                                          const unsigned char *npub,
++                                          const crypto_aead_chacha20poly1305psiv_state *ctx_)
++{
++    unsigned long long mlen = 0ULL;
++    int                ret = -1;
++
++    if (clen >= crypto_aead_chacha20poly1305psiv_ABYTES) {
++        ret = crypto_aead_chacha20poly1305psiv_decrypt_detached_afternm
++            (m, nsec, c, clen - crypto_aead_chacha20poly1305psiv_ABYTES,
++             c + clen - crypto_aead_chacha20poly1305psiv_ABYTES,
++             ad, adlen, npub, ctx_);
++    }
++    if (mlen_p != NULL) {
++        if (ret == 0) {
++            mlen = clen - crypto_aead_chacha20poly1305psiv_ABYTES;
++        }
++        *mlen_p = mlen;
++    }
++    return ret;
++}
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_encrypt_detached_afternm(unsigned char *c,
++                                                   unsigned char *mac,
++                                                   unsigned long long *maclen_p,
++                                                   const unsigned char *m,
++                                                   unsigned long long mlen,
++                                                   const unsigned char *ad,
++                                                   unsigned long long adlen,
++                                                   const unsigned char *nsec,
++                                                   const unsigned char *npub,
++                                                   const crypto_aead_chacha20poly1305psiv_state *ctx_)
++{
++    chacha20poly1305_state *ctx = (chacha20poly1305_state *) (void *) ctx_;
++    COMPILER_ASSERT((sizeof *ctx_) >= (sizeof *ctx));
++    unsigned char zero[16] = {0};
++
++    crypto_onetimeauth_poly1305_state state;
++    unsigned char slen[16U];
++    unsigned char digest[crypto_onetimeauth_poly1305_BYTES];
++
++    (void) nsec;
++    crypto_onetimeauth_poly1305_init(&state, ctx->poly1305_key);
++    crypto_onetimeauth_poly1305_update(&state, ad, adlen);
++    if (adlen%16) crypto_onetimeauth_poly1305_update(&state, zero, 16-(adlen%16));
++    STORE64_LE(slen, (uint64_t) adlen);
++    crypto_onetimeauth_poly1305_update(&state, m, mlen);
++    if (mlen%16) crypto_onetimeauth_poly1305_update(&state, zero, 16-(mlen%16));
++    STORE64_LE(slen+8, (uint64_t) mlen);
++    crypto_onetimeauth_poly1305_update(&state, slen, sizeof slen);
++    crypto_onetimeauth_poly1305_final(&state, digest);
++    crypto_stream_chacha20_psiv(mac, crypto_aead_chacha20poly1305_ABYTES, npub, ctx->tag_key, digest);
++    crypto_stream_chacha20_psiv_xor(c, m, mlen, npub, ctx->enc_key, mac);
++
++    sodium_memzero(&state, sizeof state);
++    sodium_memzero(&digest, sizeof digest);
++
++    if (maclen_p != NULL) {
++        *maclen_p = crypto_aead_chacha20poly1305_ABYTES;
++    }
++    return 0;
++}
++
++int crypto_aead_chacha20poly1305psiv_decrypt_detached_afternm(unsigned char *m,
++                                                   unsigned char *nsec,
++                                                   const unsigned char *c,
++                                                   unsigned long long clen,
++                                                   const unsigned char *mac,
++                                                   const unsigned char *ad,
++                                                   unsigned long long adlen,
++                                                   const unsigned char *npub,
++                                                   const crypto_aead_chacha20poly1305psiv_state *ctx_)
++{
++    chacha20poly1305_state *ctx = (chacha20poly1305_state *) (void *) ctx_;
++    COMPILER_ASSERT((sizeof *ctx_) >= (sizeof *ctx));
++
++    crypto_onetimeauth_poly1305_state state;
++    unsigned char zero[16] = {0};
++    unsigned char                     slen[16U];
++    unsigned char                     digest[crypto_onetimeauth_poly1305_BYTES];
++    unsigned char                     computed_mac[crypto_aead_chacha20poly1305psiv_ABYTES];
++    unsigned long long                mlen;
++    int                               ret;
++
++    (void) nsec;
++
++    crypto_onetimeauth_poly1305_init(&state, ctx->poly1305_key);
++    crypto_onetimeauth_poly1305_update(&state, ad, adlen);
++    if (adlen%16) crypto_onetimeauth_poly1305_update(&state, zero, 16-(adlen%16));
++    STORE64_LE(slen, (uint64_t) adlen);
++
++    crypto_stream_chacha20_psiv_xor(m, c, clen, npub, ctx->enc_key, mac);
++    mlen = clen;
++
++    
++    crypto_onetimeauth_poly1305_update(&state, m, mlen);
++    if (mlen%16) crypto_onetimeauth_poly1305_update(&state, zero, 16-(mlen%16));
++    STORE64_LE(slen+8, (uint64_t) mlen);
++    crypto_onetimeauth_poly1305_update(&state, slen, sizeof slen);
++    crypto_onetimeauth_poly1305_final(&state, digest);
++    crypto_stream_chacha20_psiv(computed_mac, crypto_aead_chacha20poly1305_ABYTES, npub, ctx->tag_key, digest);
++    sodium_memzero(&state, sizeof state);
++    sodium_memzero(&digest, sizeof digest);
++
++    COMPILER_ASSERT(sizeof computed_mac == 16U);
++    ret = crypto_verify_16(computed_mac, mac);
++    sodium_memzero(computed_mac, sizeof computed_mac);
++    if (ret != 0) {
++        memset(m, 0, mlen);
++        return -1;
++    }
++
++    return 0;
++}
++
++void crypto_aead_chacha20poly1305psiv_keygen(unsigned char k[crypto_aead_chacha20poly1305psiv_KEYBYTES])
++{
++    randombytes_buf(k, crypto_aead_chacha20poly1305psiv_KEYBYTES);
++}
+\ No newline at end of file
+diff --git a/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-avx2.c b/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-avx2.c
+index f63e0552..b31fdac6 100644
+--- a/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-avx2.c
++++ b/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-avx2.c
+@@ -50,6 +50,20 @@ chacha_keysetup(chacha_ctx *ctx, const uint8_t *k)
+     ctx->input[11] = LOAD32_LE(k + 28);
+ }
+ 
++static void
++chacha_psiv_keysetup(chacha_ctx *ctx, const uint8_t *k)
++{
++    ctx->input[0] = LOAD32_LE(k);
++    ctx->input[1] = LOAD32_LE(k + 4);
++    ctx->input[2] = LOAD32_LE(k + 8);
++    ctx->input[3] = LOAD32_LE(k + 12);
++    ctx->input[4] = LOAD32_LE(k + 16);
++    ctx->input[5] = LOAD32_LE(k + 20);
++    ctx->input[6] = LOAD32_LE(k + 24);
++    ctx->input[7] = LOAD32_LE(k + 28);
++    ctx->input[8] = LOAD32_LE(k + 32);
++}
++
+ static void
+ chacha_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+ {
+@@ -68,6 +82,23 @@ chacha_ietf_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+     ctx->input[15] = LOAD32_LE(iv + 8);
+ }
+ 
++static void
++chacha_psiv_ivsetup(chacha_ctx *ctx, const uint8_t *iv)
++{
++    ctx->input[9] = LOAD32_LE(iv);
++    ctx->input[10] = LOAD32_LE(iv + 4);
++    ctx->input[11] = LOAD32_LE(iv + 8);
++}
++
++static void
++chacha_psiv_tagsetup(chacha_ctx *ctx, const uint8_t *t)
++{
++    ctx->input[12] = LOAD32_LE(t);
++    ctx->input[13] = LOAD32_LE(t + 4);
++    ctx->input[14] = LOAD32_LE(t + 8);
++    ctx->input[15] = LOAD32_LE(t + 12);
++}
++
+ static void
+ chacha20_encrypt_bytes(chacha_ctx *ctx, const uint8_t *m, uint8_t *c,
+                        unsigned long long bytes)
+@@ -121,6 +152,27 @@ stream_ietf_ext_ref(unsigned char *c, unsigned long long clen,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref(unsigned char *c, unsigned long long clen,
++                const unsigned char *n, const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++
++    if (!clen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    memset(c, 0, clen);
++    chacha20_encrypt_bytes(&ctx, c, c, clen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ static int
+ stream_ref_xor_ic(unsigned char *c, const unsigned char *m,
+                   unsigned long long mlen, const unsigned char *n, uint64_t ic,
+@@ -166,12 +218,33 @@ stream_ietf_ext_ref_xor_ic(unsigned char *c, const unsigned char *m,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref_xor(unsigned char *c, const unsigned char *m,
++                       unsigned long long mlen, const unsigned char *n,
++                       const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++    if (!mlen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    chacha20_encrypt_bytes(&ctx, m, c, mlen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ struct crypto_stream_chacha20_implementation
+     crypto_stream_chacha20_dolbeau_avx2_implementation = {
+         SODIUM_C99(.stream =) stream_ref,
+         SODIUM_C99(.stream_ietf_ext =) stream_ietf_ext_ref,
+         SODIUM_C99(.stream_xor_ic =) stream_ref_xor_ic,
+-        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic
+-    };
++        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic,
++        SODIUM_C99(.stream_psiv =) stream_psiv_ref,
++        SODIUM_C99(.stream_psiv_xor =) stream_psiv_ref_xor};
+ 
+ #endif
+diff --git a/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-ssse3.c b/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-ssse3.c
+index 6f5d3851..a1ebd1dc 100644
+--- a/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-ssse3.c
++++ b/src/libsodium/crypto_stream/chacha20/dolbeau/chacha20_dolbeau-ssse3.c
+@@ -45,6 +45,20 @@ chacha_keysetup(chacha_ctx *ctx, const uint8_t *k)
+     ctx->input[11] = LOAD32_LE(k + 28);
+ }
+ 
++static void
++chacha_psiv_keysetup(chacha_ctx *ctx, const uint8_t *k)
++{
++    ctx->input[0] = LOAD32_LE(k);
++    ctx->input[1] = LOAD32_LE(k + 4);
++    ctx->input[2] = LOAD32_LE(k + 8);
++    ctx->input[3] = LOAD32_LE(k + 12);
++    ctx->input[4] = LOAD32_LE(k + 16);
++    ctx->input[5] = LOAD32_LE(k + 20);
++    ctx->input[6] = LOAD32_LE(k + 24);
++    ctx->input[7] = LOAD32_LE(k + 28);
++    ctx->input[8] = LOAD32_LE(k + 32);
++}
++
+ static void
+ chacha_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+ {
+@@ -63,6 +77,23 @@ chacha_ietf_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+     ctx->input[15] = LOAD32_LE(iv + 8);
+ }
+ 
++static void
++chacha_psiv_ivsetup(chacha_ctx *ctx, const uint8_t *iv)
++{
++    ctx->input[9] = LOAD32_LE(iv);
++    ctx->input[10] = LOAD32_LE(iv + 4);
++    ctx->input[11] = LOAD32_LE(iv + 8);
++}
++
++static void
++chacha_psiv_tagsetup(chacha_ctx *ctx, const uint8_t *t)
++{
++    ctx->input[12] = LOAD32_LE(t);
++    ctx->input[13] = LOAD32_LE(t + 4);
++    ctx->input[14] = LOAD32_LE(t + 8);
++    ctx->input[15] = LOAD32_LE(t + 12);
++}
++
+ static void
+ chacha20_encrypt_bytes(chacha_ctx *ctx, const uint8_t *m, uint8_t *c,
+                        unsigned long long bytes)
+@@ -115,6 +146,27 @@ stream_ietf_ext_ref(unsigned char *c, unsigned long long clen,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref(unsigned char *c, unsigned long long clen,
++                const unsigned char *n, const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++
++    if (!clen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    memset(c, 0, clen);
++    chacha20_encrypt_bytes(&ctx, c, c, clen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ static int
+ stream_ref_xor_ic(unsigned char *c, const unsigned char *m,
+                   unsigned long long mlen, const unsigned char *n, uint64_t ic,
+@@ -160,12 +212,33 @@ stream_ietf_ext_ref_xor_ic(unsigned char *c, const unsigned char *m,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref_xor(unsigned char *c, const unsigned char *m,
++                       unsigned long long mlen, const unsigned char *n,
++                       const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++    if (!mlen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    chacha20_encrypt_bytes(&ctx, m, c, mlen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ struct crypto_stream_chacha20_implementation
+     crypto_stream_chacha20_dolbeau_ssse3_implementation = {
+         SODIUM_C99(.stream =) stream_ref,
+         SODIUM_C99(.stream_ietf_ext =) stream_ietf_ext_ref,
+         SODIUM_C99(.stream_xor_ic =) stream_ref_xor_ic,
+-        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic
+-    };
++        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic,
++        SODIUM_C99(.stream_psiv =) stream_psiv_ref,
++        SODIUM_C99(.stream_psiv_xor =) stream_psiv_ref_xor};
+ 
+ #endif
+diff --git a/src/libsodium/crypto_stream/chacha20/ref/chacha20_ref.c b/src/libsodium/crypto_stream/chacha20/ref/chacha20_ref.c
+index 40cccbf8..3723e2ce 100644
+--- a/src/libsodium/crypto_stream/chacha20/ref/chacha20_ref.c
++++ b/src/libsodium/crypto_stream/chacha20/ref/chacha20_ref.c
+@@ -59,6 +59,20 @@ chacha_keysetup(chacha_ctx *ctx, const uint8_t *k)
+     ctx->input[11] = LOAD32_LE(k + 28);
+ }
+ 
++static void
++chacha_psiv_keysetup(chacha_ctx *ctx, const uint8_t *k)
++{
++    ctx->input[0] = LOAD32_LE(k);
++    ctx->input[1] = LOAD32_LE(k + 4);
++    ctx->input[2] = LOAD32_LE(k + 8);
++    ctx->input[3] = LOAD32_LE(k + 12);
++    ctx->input[4] = LOAD32_LE(k + 16);
++    ctx->input[5] = LOAD32_LE(k + 20);
++    ctx->input[6] = LOAD32_LE(k + 24);
++    ctx->input[7] = LOAD32_LE(k + 28);
++    ctx->input[8] = LOAD32_LE(k + 32);
++}
++
+ static void
+ chacha_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+ {
+@@ -77,6 +91,23 @@ chacha_ietf_ivsetup(chacha_ctx *ctx, const uint8_t *iv, const uint8_t *counter)
+     ctx->input[15] = LOAD32_LE(iv + 8);
+ }
+ 
++static void
++chacha_psiv_ivsetup(chacha_ctx *ctx, const uint8_t *iv)
++{
++    ctx->input[9] = LOAD32_LE(iv);
++    ctx->input[10] = LOAD32_LE(iv + 4);
++    ctx->input[11] = LOAD32_LE(iv + 8);
++}
++
++static void
++chacha_psiv_tagsetup(chacha_ctx *ctx, const uint8_t *t)
++{
++    ctx->input[12] = LOAD32_LE(t);
++    ctx->input[13] = LOAD32_LE(t + 4);
++    ctx->input[14] = LOAD32_LE(t + 8);
++    ctx->input[15] = LOAD32_LE(t + 12);
++}
++
+ static void
+ chacha20_encrypt_bytes(chacha_ctx *ctx, const uint8_t *m, uint8_t *c,
+                        unsigned long long bytes)
+@@ -258,6 +289,27 @@ stream_ietf_ext_ref(unsigned char *c, unsigned long long clen,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref(unsigned char *c, unsigned long long clen,
++                const unsigned char *n, const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++
++    if (!clen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    memset(c, 0, clen);
++    chacha20_encrypt_bytes(&ctx, c, c, clen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ static int
+ stream_ref_xor_ic(unsigned char *c, const unsigned char *m,
+                   unsigned long long mlen, const unsigned char *n, uint64_t ic,
+@@ -303,10 +355,31 @@ stream_ietf_ext_ref_xor_ic(unsigned char *c, const unsigned char *m,
+     return 0;
+ }
+ 
++static int
++stream_psiv_ref_xor(unsigned char *c, const unsigned char *m,
++                       unsigned long long mlen, const unsigned char *n,
++                       const unsigned char *k, const unsigned char *t)
++{
++    struct chacha_ctx ctx;
++    if (!mlen)
++    {
++        return 0;
++    }
++    COMPILER_ASSERT(crypto_stream_chacha20_psiv_KEYBYTES == 288 / 8);
++    chacha_psiv_keysetup(&ctx, k);
++    chacha_psiv_ivsetup(&ctx, n);
++    chacha_psiv_tagsetup(&ctx, t);
++    chacha20_encrypt_bytes(&ctx, m, c, mlen);
++    sodium_memzero(&ctx, sizeof ctx);
++
++    return 0;
++}
++
+ struct crypto_stream_chacha20_implementation
+     crypto_stream_chacha20_ref_implementation = {
+         SODIUM_C99(.stream =) stream_ref,
+         SODIUM_C99(.stream_ietf_ext =) stream_ietf_ext_ref,
+         SODIUM_C99(.stream_xor_ic =) stream_ref_xor_ic,
+-        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic
+-    };
++        SODIUM_C99(.stream_ietf_ext_xor_ic =) stream_ietf_ext_ref_xor_ic,
++        SODIUM_C99(.stream_psiv =) stream_psiv_ref,
++        SODIUM_C99(.stream_psiv_xor =) stream_psiv_ref_xor};
+diff --git a/src/libsodium/crypto_stream/chacha20/stream_chacha20.c b/src/libsodium/crypto_stream/chacha20/stream_chacha20.c
+index 427c3fb0..0e285631 100644
+--- a/src/libsodium/crypto_stream/chacha20/stream_chacha20.c
++++ b/src/libsodium/crypto_stream/chacha20/stream_chacha20.c
+@@ -51,6 +51,30 @@ crypto_stream_chacha20_ietf_messagebytes_max(void)
+     return crypto_stream_chacha20_ietf_MESSAGEBYTES_MAX;
+ }
+ 
++size_t
++crypto_stream_chacha20_psiv_keybytes(void)
++{
++    return crypto_stream_chacha20_psiv_KEYBYTES;
++}
++
++size_t
++crypto_stream_chacha20_psiv_noncebytes(void)
++{
++    return crypto_stream_chacha20_psiv_NONCEBYTES;
++}
++
++size_t
++crypto_stream_chacha20_psiv_messagebytes_max(void)
++{
++    return crypto_stream_chacha20_psiv_MESSAGEBYTES_MAX;
++}
++
++size_t
++crypto_stream_chacha20_psiv_tagbytes(void)
++{
++    return crypto_stream_chacha20_psiv_TAGBYTES;
++}
++
+ int
+ crypto_stream_chacha20(unsigned char *c, unsigned long long clen,
+                        const unsigned char *n, const unsigned char *k)
+@@ -163,6 +187,32 @@ crypto_stream_chacha20_keygen(unsigned char k[crypto_stream_chacha20_KEYBYTES])
+     randombytes_buf(k, crypto_stream_chacha20_KEYBYTES);
+ }
+ 
++int crypto_stream_chacha20_psiv(unsigned char *c, unsigned long long clen,
++                                const unsigned char *n, const unsigned char *k, const unsigned char *t)
++{
++    if (clen > crypto_stream_chacha20_MESSAGEBYTES_MAX)
++    {
++        sodium_misuse();
++    }
++    return implementation->stream_psiv(c, clen, n, k, t);
++}
++
++int crypto_stream_chacha20_psiv_xor(unsigned char *c, const unsigned char *m,
++                                    unsigned long long mlen, const unsigned char *n,
++                                    const unsigned char *k, const unsigned char *t)
++{
++    if (mlen > crypto_stream_chacha20_MESSAGEBYTES_MAX)
++    {
++        sodium_misuse();
++    }
++    return implementation->stream_psiv_xor(c, m, mlen, n, k, t);
++}
++
++void crypto_stream_chacha20_psiv_keygen(unsigned char k[crypto_stream_chacha20_psiv_KEYBYTES])
++{
++    randombytes_buf(k, crypto_stream_chacha20_psiv_KEYBYTES);
++}
++
+ int
+ _crypto_stream_chacha20_pick_best_implementation(void)
+ {
+diff --git a/src/libsodium/crypto_stream/chacha20/stream_chacha20.h b/src/libsodium/crypto_stream/chacha20/stream_chacha20.h
+index 40f782f4..6bdeec5b 100644
+--- a/src/libsodium/crypto_stream/chacha20/stream_chacha20.h
++++ b/src/libsodium/crypto_stream/chacha20/stream_chacha20.h
+@@ -17,6 +17,13 @@ typedef struct crypto_stream_chacha20_implementation {
+                                   unsigned long long mlen,
+                                   const unsigned char *n, uint32_t ic,
+                                   const unsigned char *k);
++    int (*stream_psiv)(unsigned char *c, unsigned long long clen,
++                       const unsigned char *n, const unsigned char *k, const unsigned char *t);
++
++    int (*stream_psiv_xor)(unsigned char *c, const unsigned char *m,
++                              unsigned long long mlen,
++                              const unsigned char *n,
++                              const unsigned char *k, const unsigned char *t);
+ } crypto_stream_chacha20_implementation;
+ 
+ #endif
+diff --git a/src/libsodium/include/sodium/crypto_aead_chacha20poly1305.h b/src/libsodium/include/sodium/crypto_aead_chacha20poly1305.h
+index 5d671df1..aea5fe91 100644
+--- a/src/libsodium/include/sodium/crypto_aead_chacha20poly1305.h
++++ b/src/libsodium/include/sodium/crypto_aead_chacha20poly1305.h
+@@ -165,6 +165,146 @@ SODIUM_EXPORT
+ void crypto_aead_chacha20poly1305_keygen(unsigned char k[crypto_aead_chacha20poly1305_KEYBYTES])
+             __attribute__ ((nonnull));
+ 
++/* -- ChaCha20-Poly1305-PSIV*/
++
++#define crypto_aead_chacha20poly1305psiv_KEYBYTES 32U
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_keybytes(void);
++
++#define crypto_aead_chacha20poly1305psiv_NSECBYTES 0U
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_nsecbytes(void);
++
++#define crypto_aead_chacha20poly1305psiv_NPUBBYTES 12U
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_npubbytes(void);
++
++#define crypto_aead_chacha20poly1305psiv_ABYTES 16U
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_abytes(void);
++
++#define crypto_aead_chacha20poly1305psiv_MESSAGEBYTES_MAX \
++    (SODIUM_SIZE_MAX - crypto_aead_chacha20poly1305psiv_ABYTES)
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_messagebytes_max(void);
++
++typedef struct CRYPTO_ALIGN(16) crypto_aead_chacha20poly1305psiv_state_ {
++    unsigned char opaque[32+36*2];
++} crypto_aead_chacha20poly1305psiv_state;
++
++SODIUM_EXPORT
++size_t crypto_aead_chacha20poly1305psiv_statebytes(void);
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_encrypt(unsigned char *c,
++                                  unsigned long long *clen_p,
++                                  const unsigned char *m,
++                                  unsigned long long mlen,
++                                  const unsigned char *ad,
++                                  unsigned long long adlen,
++                                  const unsigned char *nsec,
++                                  const unsigned char *npub,
++                                  const unsigned char *k)
++            __attribute__ ((nonnull(1, 8, 9)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_decrypt(unsigned char *m,
++                                  unsigned long long *mlen_p,
++                                  unsigned char *nsec,
++                                  const unsigned char *c,
++                                  unsigned long long clen,
++                                  const unsigned char *ad,
++                                  unsigned long long adlen,
++                                  const unsigned char *npub,
++                                  const unsigned char *k)
++            __attribute__ ((warn_unused_result)) __attribute__ ((nonnull(1, 4, 8, 9)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_encrypt_detached(unsigned char *c,
++                                           unsigned char *mac,
++                                           unsigned long long *maclen_p,
++                                           const unsigned char *m,
++                                           unsigned long long mlen,
++                                           const unsigned char *ad,
++                                           unsigned long long adlen,
++                                           const unsigned char *nsec,
++                                           const unsigned char *npub,
++                                           const unsigned char *k)
++            __attribute__ ((nonnull(1, 2, 9, 10)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_decrypt_detached(unsigned char *m,
++                                           unsigned char *nsec,
++                                           const unsigned char *c,
++                                           unsigned long long clen,
++                                           const unsigned char *mac,
++                                           const unsigned char *ad,
++                                           unsigned long long adlen,
++                                           const unsigned char *npub,
++                                           const unsigned char *k)
++            __attribute__ ((warn_unused_result)) __attribute__ ((nonnull(1, 3, 5, 8, 9)));
++
++
++// Precomputation interface
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_beforenm(crypto_aead_chacha20poly1305psiv_state *ctx_,
++                                   const unsigned char *k)
++            __attribute__ ((nonnull));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_encrypt_afternm(unsigned char *c,
++                                          unsigned long long *clen_p,
++                                          const unsigned char *m,
++                                          unsigned long long mlen,
++                                          const unsigned char *ad,
++                                          unsigned long long adlen,
++                                          const unsigned char *nsec,
++                                          const unsigned char *npub,
++                                          const crypto_aead_chacha20poly1305psiv_state *ctx_)
++            __attribute__ ((nonnull(1, 8, 9)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_decrypt_afternm(unsigned char *m,
++                                          unsigned long long *mlen_p,
++                                          unsigned char *nsec,
++                                          const unsigned char *c,
++                                          unsigned long long clen,
++                                          const unsigned char *ad,
++                                          unsigned long long adlen,
++                                          const unsigned char *npub,
++                                          const crypto_aead_chacha20poly1305psiv_state *ctx_)
++            __attribute__ ((warn_unused_result)) __attribute__ ((nonnull(1, 4, 8, 9)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_encrypt_detached_afternm(unsigned char *c,
++                                                   unsigned char *mac,
++                                                   unsigned long long *maclen_p,
++                                                   const unsigned char *m,
++                                                   unsigned long long mlen,
++                                                   const unsigned char *ad,
++                                                   unsigned long long adlen,
++                                                   const unsigned char *nsec,
++                                                   const unsigned char *npub,
++                                                   const crypto_aead_chacha20poly1305psiv_state *ctx_)
++            __attribute__ ((nonnull(1, 2, 9, 10)));
++
++SODIUM_EXPORT
++int crypto_aead_chacha20poly1305psiv_decrypt_detached_afternm(unsigned char *m,
++                                                   unsigned char *nsec,
++                                                   const unsigned char *c,
++                                                   unsigned long long clen,
++                                                   const unsigned char *mac,
++                                                   const unsigned char *ad,
++                                                   unsigned long long adlen,
++                                                   const unsigned char *npub,
++                                                   const crypto_aead_chacha20poly1305psiv_state *ctx_)
++            __attribute__ ((warn_unused_result)) __attribute__ ((nonnull(1, 3, 5, 8, 9)));
++
++SODIUM_EXPORT
++void crypto_aead_chacha20poly1305psiv_keygen(unsigned char k[crypto_aead_chacha20poly1305psiv_KEYBYTES])
++            __attribute__ ((nonnull));
++
+ /* Aliases */
+ 
+ #define crypto_aead_chacha20poly1305_IETF_KEYBYTES         crypto_aead_chacha20poly1305_ietf_KEYBYTES
+diff --git a/src/libsodium/include/sodium/crypto_stream_chacha20.h b/src/libsodium/include/sodium/crypto_stream_chacha20.h
+index 40889755..4660773b 100644
+--- a/src/libsodium/include/sodium/crypto_stream_chacha20.h
++++ b/src/libsodium/include/sodium/crypto_stream_chacha20.h
+@@ -93,6 +93,40 @@ SODIUM_EXPORT
+ void crypto_stream_chacha20_ietf_keygen(unsigned char k[crypto_stream_chacha20_ietf_KEYBYTES])
+             __attribute__ ((nonnull));
+ 
++/* ChaCha20 for PSIV */
++
++#define crypto_stream_chacha20_psiv_KEYBYTES 36U
++SODIUM_EXPORT
++size_t crypto_stream_chacha20_psiv_keybytes(void);
++
++#define crypto_stream_chacha20_psiv_NONCEBYTES 12U
++SODIUM_EXPORT
++size_t crypto_stream_chacha20_psiv_noncebytes(void);
++
++#define crypto_stream_chacha20_psiv_MESSAGEBYTES_MAX \
++    SODIUM_SIZE_MAX
++SODIUM_EXPORT
++size_t crypto_stream_chacha20_psiv_messagebytes_max(void);
++
++#define crypto_stream_chacha20_psiv_TAGBYTES 16U
++SODIUM_EXPORT
++size_t crypto_stream_chacha20_psiv_tagbytes(void);
++
++SODIUM_EXPORT
++int crypto_stream_chacha20_psiv(unsigned char *c, unsigned long long clen,
++                                const unsigned char *n, const unsigned char *k, const unsigned char *t)
++            __attribute__ ((nonnull));
++
++SODIUM_EXPORT
++int crypto_stream_chacha20_psiv_xor(unsigned char *c, const unsigned char *m,
++                                    unsigned long long mlen, const unsigned char *n,
++                                    const unsigned char *k, const unsigned char *t)
++            __attribute__ ((nonnull));
++
++SODIUM_EXPORT
++void crypto_stream_chacha20_psiv_keygen(unsigned char k[crypto_stream_chacha20_psiv_KEYBYTES])
++            __attribute__ ((nonnull));
++
+ /* Aliases */
+ 
+ #define crypto_stream_chacha20_IETF_KEYBYTES crypto_stream_chacha20_ietf_KEYBYTES
+diff --git a/test/default/aead_chacha20poly1305.c b/test/default/aead_chacha20poly1305.c
+index 0a01afe1..f6bc4c9d 100644
+--- a/test/default/aead_chacha20poly1305.c
++++ b/test/default/aead_chacha20poly1305.c
+@@ -362,11 +362,162 @@ tv_ietf(void)
+     return 0;
+ }
+ 
++static int
++tv_psiv(void)
++{
++#undef  MLEN
++#define MLEN 10U
++#undef  ADLEN
++#define ADLEN 10U
++#undef  CLEN
++#define CLEN (MLEN + crypto_aead_chacha20poly1305psiv_ABYTES)
++    static const unsigned char firstkey[crypto_aead_chacha20poly1305psiv_KEYBYTES]
++        = { 0x42, 0x90, 0xbc, 0xb1, 0x54, 0x17, 0x35, 0x31, 0xf3, 0x14, 0xaf,
++            0x57, 0xf3, 0xbe, 0x3b, 0x50, 0x06, 0xda, 0x37, 0x1e, 0xce, 0x27,
++            0x2a, 0xfa, 0x1b, 0x5d, 0xbd, 0xd1, 0x10, 0x0a, 0x10, 0x07 };
++    static const unsigned char m[MLEN]
++        = { 0x86, 0xd0, 0x99, 0x74, 0x84, 0x0b, 0xde, 0xd2, 0xa5, 0xca };
++    static const unsigned char nonce[crypto_aead_chacha20poly1305psiv_NPUBBYTES]
++        = { 0xcd, 0x7c, 0xf6, 0x7b, 0xe3, 0x9c, 0x79, 0x4a };
++    static const unsigned char ad[ADLEN]
++        = { 0x87, 0xe2, 0x29, 0xd4, 0x50, 0x08, 0x45, 0xa0, 0x79, 0xc0 };
++    unsigned char *c = (unsigned char *) sodium_malloc(CLEN);
++    unsigned char *detached_c = (unsigned char *) sodium_malloc(MLEN);
++    unsigned char *mac = (unsigned char *) sodium_malloc(crypto_aead_chacha20poly1305psiv_ABYTES);
++    unsigned char *m2 = (unsigned char *) sodium_malloc(MLEN);
++    unsigned long long found_clen;
++    unsigned long long found_maclen;
++    unsigned long long m2len;
++    size_t i;
++
++    crypto_aead_chacha20poly1305psiv_encrypt(c, &found_clen, m, MLEN,
++                                         ad, ADLEN,
++                                         NULL, nonce, firstkey);
++    if (found_clen != CLEN) {
++        printf("found_clen is not properly set\n");
++    }
++    crypto_aead_chacha20poly1305psiv_encrypt_detached(detached_c,
++                                                  mac, &found_maclen,
++                                                  m, MLEN, ad, ADLEN,
++                                                  NULL, nonce, firstkey);
++    if (found_maclen != crypto_aead_chacha20poly1305psiv_abytes()) {
++        printf("found_maclen is not properly set\n");
++    }
++    if (memcmp(detached_c, c, MLEN) != 0) {
++        printf("detached ciphertext is bogus\n");
++    }
++
++    if (crypto_aead_chacha20poly1305psiv_decrypt(m2, &m2len, NULL, c, CLEN,
++                                             ad, ADLEN,
++                                             nonce, firstkey) != 0) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt() failed\n");
++    }
++    if (m2len != MLEN) {
++        printf("m2len is not properly set\n");
++    }
++    if (memcmp(m, m2, MLEN) != 0) {
++        printf("m != m2\n");
++    }
++    memset(m2, 0, m2len);
++    if (crypto_aead_chacha20poly1305psiv_decrypt_detached(m2, NULL,
++                                                      c, MLEN, mac,
++                                                      ad, ADLEN,
++                                                      nonce, firstkey) != 0) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt_detached() failed\n");
++    }
++    if (memcmp(m, m2, MLEN) != 0) {
++        printf("detached m != m2\n");
++    }
++
++    for (i = 0U; i < CLEN; i++) {
++        c[i] ^= (i + 1U);
++        if (crypto_aead_chacha20poly1305psiv_decrypt(m2, NULL, NULL, c, CLEN,
++                                                 ad, ADLEN, nonce, firstkey)
++            == 0 || memcmp(m, m2, MLEN) == 0) {
++            printf("message can be forged\n");
++        }
++        c[i] ^= (i + 1U);
++    }
++
++    crypto_aead_chacha20poly1305psiv_encrypt(c, &found_clen, m, MLEN,
++                                         NULL, 0U, NULL, nonce, firstkey);
++    if (found_clen != CLEN) {
++        printf("found_clen is not properly set (adlen=0)\n");
++    }
++
++    if (crypto_aead_chacha20poly1305psiv_decrypt(m2, &m2len, NULL, c, CLEN,
++                                             NULL, 0U, nonce, firstkey) != 0) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt() failed (adlen=0)\n");
++    }
++    if (m2len != MLEN) {
++        printf("m2len is not properly set (adlen=0)\n");
++    }
++    if (memcmp(m, m2, MLEN) != 0) {
++        printf("m != m2 (adlen=0)\n");
++    }
++    m2len = 1;
++    if (crypto_aead_chacha20poly1305psiv_decrypt(
++            m2, &m2len, NULL, guard_page,
++            randombytes_uniform(crypto_aead_chacha20poly1305psiv_ABYTES),
++            NULL, 0U, nonce, firstkey) != -1) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt() worked with a short "
++               "ciphertext\n");
++    }
++    if (m2len != 0) {
++        printf("Message length should have been set to zero after a failure\n");
++    }
++    m2len = 1;
++    if (crypto_aead_chacha20poly1305psiv_decrypt(m2, &m2len, NULL, c, 0U, NULL, 0U,
++                                             nonce, firstkey) != -1) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt() worked with an empty "
++               "ciphertext\n");
++    }
++    if (m2len != 0) {
++        printf("Message length should have been set to zero after a failure\n");
++    }
++
++    memcpy(c, m, MLEN);
++    crypto_aead_chacha20poly1305psiv_encrypt(c, &found_clen, c, MLEN,
++                                         NULL, 0U, NULL, nonce, firstkey);
++    if (found_clen != CLEN) {
++        printf("found_clen is not properly set (adlen=0)\n");
++    }
++
++    if (crypto_aead_chacha20poly1305psiv_decrypt(c, &m2len, NULL, c, CLEN,
++                                             NULL, 0U, nonce, firstkey) != 0) {
++        printf("crypto_aead_chacha20poly1305psiv_decrypt() failed (adlen=0)\n");
++    }
++    if (m2len != MLEN) {
++        printf("m2len is not properly set (adlen=0)\n");
++    }
++    if (memcmp(m, c, MLEN) != 0) {
++        printf("m != c (adlen=0)\n");
++    }
++
++    sodium_free(c);
++    sodium_free(detached_c);
++    sodium_free(mac);
++    sodium_free(m2);
++
++    assert(crypto_aead_chacha20poly1305psiv_keybytes() > 0U);
++    assert(crypto_aead_chacha20poly1305psiv_npubbytes() > 0U);
++    assert(crypto_aead_chacha20poly1305psiv_nsecbytes() == 0U);
++    assert(crypto_aead_chacha20poly1305psiv_messagebytes_max() > 0U);
++    assert(crypto_aead_chacha20poly1305psiv_messagebytes_max() == crypto_aead_chacha20poly1305psiv_MESSAGEBYTES_MAX);
++    assert(crypto_aead_chacha20poly1305psiv_keybytes() == crypto_aead_chacha20poly1305psiv_KEYBYTES);
++    assert(crypto_aead_chacha20poly1305psiv_nsecbytes() == crypto_aead_chacha20poly1305psiv_NSECBYTES);
++    assert(crypto_aead_chacha20poly1305psiv_npubbytes() == crypto_aead_chacha20poly1305psiv_NPUBBYTES);
++    assert(crypto_aead_chacha20poly1305psiv_abytes() == crypto_aead_chacha20poly1305psiv_ABYTES);
++
++    return 0;
++}
++
+ int
+ main(void)
+ {
+     tv();
+     tv_ietf();
++    tv_psiv();
+ 
+     return 0;
+ }
+diff --git a/test/default/aead_chacha20poly13052.c b/test/default/aead_chacha20poly13052.c
+index 8c59ecaf..f9bdae8b 100644
+--- a/test/default/aead_chacha20poly13052.c
++++ b/test/default/aead_chacha20poly13052.c
+@@ -944,6 +944,76 @@ static struct {
+       "73eb2724b5c405f04d00d0f15840a1c1", "valid" }
+ };
+ 
++static struct {
++    const char *key_hex;
++    const char  nonce_hex[crypto_aead_chacha20poly1305psiv_NPUBBYTES * 2 + 1];
++    const char *ad_hex;
++    const char *message_hex;
++    const char *detached_ciphertext_hex;
++    const char  mac_hex[crypto_aead_chacha20poly1305psiv_ABYTES * 2 + 1];
++    const char *outcome;
++} tests2[] = {
++    { "da5e8b4dc96a45cbf6868996cf9374968639a0e462993a5a4ce0f50c30387b4d",
++      "baf068c8aa4fecc4485f0673", "fb69bf2be138f95831e2f80cd6",
++      "53bc",
++      "be6d",
++      "b414135310ce4430cddcdc883d0b8533", "valid" },
++
++    { "8c5f631e8f9d29efa780d031232022a1d388aeb3f4d50592dd0d05d7cc5d4bc1",
++      "e5ddfb49845b9dc73dfa4b10", "126ce447818b55571d725495e6614a6f",
++      "31d5c270085a9f80ef90ebf732d928e8",
++      "ae44247314351bfca354474c71998195",
++      "6d5c42a83ad867653625c10f6ef05385", "valid" },
++
++    { "81432e9fa573a3e0aaa352f668a15b754c81502ed14c8ee6fc9ec0fb7100344d",
++    "78904fc961c52e65e13d302e", "663f149d40338426e81e5257991630202dd06ced12a2bca83f89dc7296541782",
++    "d0037b9ad2e00b2f698c26a791c0a67ee5a298929ce5ce2ba4999a5d89befa92",
++    "6266ba8132a9193af5e9d8511c27166050e01571e55a3d27d3ab98e5b6a3c11b",
++    "4e43af952bb555961f2910633ece24fc", "valid" },
++
++    { "faad2687fe7fcaad896a50dd005089a8fee8d95e79e3705d8136b5c45ef03d1a",
++      "2748826716da2a887ff63885", "e85d908a97f6673421e1c4ad674d792e914972147191be9e2b1158f489eb47a41a594112cc74854c521d84029a959cfd",
++      "93dd95401f779b9fcd64261c94e861ed0947c378654dfe8cda6776a0a5e5d35e83cbb595cbd1b449b2278f17e81ac83f",
++      "e898487b800760a38f2727161264ac3e439606a94a0525f8eb0f4ade565cccbd25e3df2415b5cf71fbf9e871816de8d7",
++      "5bf71bbda8e147f51524395009d1bbd2", "valid" },
++
++    { "6df081bcb85c439a1def71c8aaf69d3c885b992ba9c8271fd6c969f48e0b11c6",
++      "ebb85860f597fc51715eb5d6", "3e00e080c3bffc3ec4b2e45dc09faaf9caae0a92fb74eb4b245c0a6aa0109d4932208478022ed98a6815cd57cd34e0cc2ad0b85a37cd03d955012e2f69e6a030",
++      "8525879de99305c0fdc4edeb66dc229faaaebf111804253afba2a2878313dda53009531fee0ff5613e39ea694efe7093ae7b349851700e5f6075cd5cbd784df0",
++      "f194e1e2f8288afd6a8013d8a14eb32851fedb97ce9151c25ca7678ec7eb7eb62652e1176666799f379307e92c79263c948bc3b6cd9aeeded02d98fcedb1c94f",
++      "8beaf75797d5f4c316b946cfb0de31ee", "valid" },
++
++    { "fce8cb2c75f84f98f44ae5a48dbbebe46536ebae80a054aeeaefbdceb3a1a956",
++      "86c43a87f6082ca50a2cf552", "c1d6753875f2f1a7223ef8769b2136f171124ce1bf502ded1429439407f91fabcb16a354d958dba41a475de6137b2cbd4e4c2dcf3334e351d09f504db6f78ed783c92b622637304e4e50faab674040f8",
++      "caa171079f29612875d0bac2772e563add27281d91376bc72c1e9ad7fbff3af3910fe2c1d6432df3cda86ccf931fb439f22c492d3e1cc1dd5aecbd312045aacafffabf3d4ef8cadafa685a371f299c38",
++      "19c86459a6b3aa8ce0a99849e995a633461642553c0b8b5935d67d796b3bfc46888575636dfa7c4f8343a302dcc0296089115d0713c8a84376dbdd3afdb15b41b494c35feab382a876dec957abf6990a",
++      "056b0315e62c7925d20495f5ee1824cc", "valid" },
++
++    { "8b119e13f8ad308e0d2a15284b45dad10de7c700f30148e3bf12c137eaa4125b",
++      "ce81fc611e7f1160413e6d52", "65536d29922a97570818bda61970f2130260bd404447552dc1b8be4f4fb3a7d403479926c82e18846bed7c326b43b605cdd9a589f5467bbac21735ae8d6000477936e294dde2ab0e58da59aa847be8b85207e437c53c61c879e2365e62357203",
++      "4e38a5eda409058b6ccfc9759f73042b3a91fa7f85757346f8199567b92c4702524942753e3f1b06aa2bd0a65b60fc555bd6e737e121ef27084938c5149e42d9421feba9201d9a553128b84c7de17fe34754829307f11a184057a05fc408a2fb",
++      "d70af5d8999d64ac57cf477e5b49b22ef39c0b9cde96b10312bfda93bbe4f2d0901dc3081c0439df34fe991383c1773f27e7c13a04d7c52ff2696fc60d076428ab03d3e7ef19618861fa99577da350ec7745779660f093c0bec764b7afd2a7df",
++      "c463dea4dc1b6ccd711aef9823da39e9", "valid" },
++
++    { "9d1efe472184bcedc72fc0ef1e1462d8f1e5a62a7430e08df26d04026e6135d8",
++      "b5141ce04e81f40113337293", "dbb0d72f901383b584eb7ab4cd070ad0dae9de2904fb03ae39d09bf96b9d1cd75cbb196154323321b2ed8ecb7dc14ece42008c889cab063250d15050f3281e4df55afcef1f411837a8ccc7546f4c571846e38c5afd846eadae7171b01f93f57c841ad02819bc2bfc7de607ef19a73ec3",
++      "d1e946809fb78c7e4e145870f70982cf950dcb18856fb96477f5fdfc3e542227456cb3c501494facd3c2f08a31bdb5198993db98346241fb54559a650067d97e45227fd89408d33c322b70eb081f5b5b3ddd084147bb0cf8826790deb4bb0b5cd34e92475f141353e6dbdc839ff44697",
++      "fd1422017e046f8940669371ed905eda2cc8f0b33586794bdbd99625ae7694c9c6bb0f6d3cf3353d0ed732241800063b45c16ca0ddf616d1f82ac1fbb2a42a96e6fde25e7439c064d45766bbcd277b8908e6561cb52bc494635a6d1b7c4d86b05bac9f647f9197efee25ebaa1ab9a22c",
++      "4d12a32e158b02657bd4a7c9fa676529", "valid" },
++
++    { "af8ce66d984e6507f1a810bf372324cd91e1d52a2d232148f4ad240ac1620059",
++      "7d2a7c08cdc00e531bd8ef56", "88d029543383ecbb02783ddd4419d0e5af3b389a666dff57882b5c49a1e0fb50bc78f7c8b2f0d5cabd832d3a10d8ee2d06a414ce4f5e645bb8b6c032e3f9d17cbe31b1313d5345f109c8251759c6a415dcc0340779b6bb40aea06ca323c6ab5690b713e1dea52fc3fe99926bacaca9d7888b6dd39569d534494a63cc602dcc9b",
++      "505c5d76005285cd7f4dd9196023d466b4bdae3e03a9ad5ef6b63def0a74442fe27132496935e010a6a15f785eaaa7367bc0b2ca9381873dbb80eb22701113ca5a996faf3d97c85bb16d62c581ee90ff73ebaa6f7a34f7a1acf784a854d73aecbb5aede2c197a73b1ad057a8d1c7e798e7a686a94dcfb8b1047bc9442d42c535",
++      "ce98619c023027e08eeb67c44b3801547191c01db1bb840164490da254f2196669347b9db669feb505a7126fe29c2c3eb1a5aeb7a46dbc8f3966316bfb39b8e189d5e5be09e42ac668a6dd218b72652d3851c2895982bb52f055a172b729aaa351dc213db04738395565b3e31b4a4bb84823e33066dda7aca1c473dff2eaf964",
++      "12c1ee0e495c42ef85fc602fa4393934", "valid" },
++
++    { "d58e34f08258aadad1cdf264b893c34b6d8c9ea4048640310b96b937e3e344e3",
++      "2b0a958f3e2dfc64431b3410", "88b216f01541dd888e4fd04443e638b4498758643583a7b04d13277d48e6096f3f4d33e3e387a1d90ac6d1a53c0574c1290099386834f803f48ff8c21b68d9650dcebd2232c9c2775bdf0fe28765bd1f5bf1392f9ba262264ef19f371fa1351055a74c8566098e9e861759ffe58e14cacc909fcaaeac4fbe7466613ddc09ded32cec9e4a014d64ab7eccafd58914ed1b",
++      "4be34f526d428683def93efc38d2c4f710ee7637aba54ff086d278128d3b68420c31982a772b15c5438158ed090d65c6f8f5cba4e8a320eea7d500d1c490fc6c59f8991ef58164f46c8b2685c08b2d85bff6b480d30d5ba14e3d1e96e28e880ed63a6c1738b6575334076a42522fb9b22c9164faa9fcc69881976e3773345dacf232a6b7e1a852ee6ddf8dd51f84e6b0",
++      "06e5d414215a1e2aefdfae18c54fe721e21f163dcf6454babce5b3a5be2f219a110e9b893addc5177b6ad48ddd6a6f4981c6309f67e3101387646a8970ab13593c3ac62cd57c608fa7f5f4be8c214171eaa223e7d291c9ee2979339d74438ad7084526224e8df5909b37d6a0fb2a97be1b2f1d26ac8a8024edabe05ac8828f1eb8bb0a9236669bf75613264272e81f2a",
++      "91329d284bad6b733d3d48467d4cce45", "valid" },
++};
++
+ static int
+ tv(void)
+ {
+@@ -1036,10 +1106,103 @@ tv(void)
+     return 0;
+ }
+ 
++static int
++tvpsiv(void)
++{
++  unsigned char *ad;
++    unsigned char *decrypted;
++    unsigned char *detached_ciphertext;
++    unsigned char *key;
++    unsigned char *message;
++    unsigned char *mac;
++    unsigned char *nonce;
++    size_t         ad_len;
++    size_t         detached_ciphertext_len;
++    size_t         message_len;
++    unsigned int   i;
++
++    key = (unsigned char *) sodium_malloc(
++        crypto_aead_chacha20poly1305psiv_KEYBYTES);
++    nonce = (unsigned char *) sodium_malloc(
++        crypto_aead_chacha20poly1305psiv_NPUBBYTES);
++    mac = (unsigned char *) sodium_malloc(
++        crypto_aead_chacha20poly1305psiv_ABYTES);
++
++    for (i = 0U; i < (sizeof tests2) / (sizeof tests2[0]); i++) {
++        assert(strlen(tests2[i].key_hex) ==
++               2 * crypto_aead_chacha20poly1305psiv_KEYBYTES);
++        sodium_hex2bin(key, crypto_aead_chacha20poly1305psiv_KEYBYTES,
++                       tests2[i].key_hex, strlen(tests2[i].key_hex), NULL, NULL,
++                       NULL);
++
++        assert(strlen(tests2[i].nonce_hex) ==
++               2 * crypto_aead_chacha20poly1305psiv_NPUBBYTES);
++        sodium_hex2bin(nonce, crypto_aead_chacha20poly1305psiv_NPUBBYTES,
++                       tests2[i].nonce_hex, strlen(tests2[i].nonce_hex), NULL,
++                       NULL, NULL);
++
++        message_len = strlen(tests2[i].message_hex) / 2;
++        message     = (unsigned char *) sodium_malloc(message_len);
++        sodium_hex2bin(message, message_len, tests2[i].message_hex,
++                       strlen(tests2[i].message_hex), NULL, NULL, NULL);
++
++        ad_len = strlen(tests2[i].ad_hex) / 2;
++        ad     = (unsigned char *) sodium_malloc(ad_len);
++        sodium_hex2bin(ad, ad_len, tests2[i].ad_hex, strlen(tests2[i].ad_hex),
++                       NULL, NULL, NULL);
++
++        detached_ciphertext_len = message_len;
++        assert(strlen(tests2[i].detached_ciphertext_hex) == 2 * message_len);
++        assert(strlen(tests2[i].mac_hex) ==
++               2 * crypto_aead_chacha20poly1305psiv_ABYTES);
++        sodium_hex2bin(mac, crypto_aead_chacha20poly1305psiv_ABYTES,
++                       tests2[i].mac_hex, strlen(tests2[i].mac_hex), NULL, NULL,
++                       NULL);
++
++        detached_ciphertext =
++            (unsigned char *) sodium_malloc(detached_ciphertext_len);
++        sodium_hex2bin(detached_ciphertext, detached_ciphertext_len,
++                       tests2[i].detached_ciphertext_hex,
++                       strlen(tests2[i].detached_ciphertext_hex), NULL, NULL,
++                       NULL);
++
++        decrypted = (unsigned char *) sodium_malloc(message_len);
++        if (crypto_aead_chacha20poly1305psiv_decrypt_detached(
++                decrypted, NULL, detached_ciphertext, detached_ciphertext_len,
++                mac, ad, ad_len, nonce, key) == 0) {
++            if (strcmp(tests2[i].outcome, "valid") != 0) {
++                printf("***psiv test case %u succeeded, was supposed to be %s\n", i,
++                       tests2[i].outcome);
++            }
++            if (memcmp(decrypted, message, message_len) != 0) {
++                printf("psiv Incorrect decryption of test vector #%u\n",
++                       (unsigned int) i);
++            }
++        } else {
++            if (strcmp(tests2[i].outcome, "invalid") != 0) {
++                printf("***psiv test case %u failed, was supposed to be %s\n", i,
++                       tests2[i].outcome);
++            }
++        }
++
++        sodium_free(message);
++        sodium_free(ad);
++        sodium_free(decrypted);
++        sodium_free(detached_ciphertext);
++    }
++
++    sodium_free(key);
++    sodium_free(mac);
++    sodium_free(nonce);
++
++    return 0;
++}
++
+ int
+ main(void)
+ {
+     tv();
++    tvpsiv();
+     printf("OK\n");
+ 
+     return 0;
+-- 
+2.43.5
+
